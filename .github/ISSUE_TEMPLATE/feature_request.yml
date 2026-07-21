@@ -1,0 +1,29 @@
+name: Feature request
+description: Propose a scoped product or evaluation improvement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: Describe the workflow problem before the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: evaluation
+    attributes:
+      label: How should we evaluate it?
+      description: Include outcome, token, cost, latency, or review metrics.
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Trust and compatibility risks
