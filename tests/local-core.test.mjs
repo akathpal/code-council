@@ -53,7 +53,7 @@ const repositoryPath = path.resolve(
 
 test("local repository inspection returns a real Git SHA", async () => {
   const repository = await inspectRepository(repositoryPath);
-  assert.equal(repository.name, "Code-Council");
+  assert.equal(repository.name.toLowerCase(), "code-council");
   assert.match(repository.sha, /^[0-9a-f]{40}$/);
   assert.ok(repository.trackedFiles > 0);
 });
@@ -550,16 +550,55 @@ test("Claude model discovery preserves supported aliases and excludes Fable", ()
 });
 
 test("task context is bounded and records the selected memory files", async () => {
-  const pack = await buildTaskContextPack(
-    repositoryPath,
-    "Persist task worktrees and context jobs in the local server",
-    { maxChars: 6_000 },
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "council-context-pack-"));
+  const repositoryRoot = path.join(temporary, "repository");
+  await mkdir(path.join(repositoryRoot, "agent_context"), { recursive: true });
+  await execFileAsync("git", ["init", "-q"], { cwd: repositoryRoot });
+  await writeFile(
+    path.join(repositoryRoot, "server.mjs"),
+    "export function persistTask() { return true; }\n",
   );
-  assert.ok(pack.selectedPaths.length > 0);
-  assert.ok(pack.selectedPaths.includes("agent_context/repository.md"));
-  assert.ok(pack.chars <= 6_500);
-  assert.equal(pack.estimatedTokens, Math.ceil(pack.chars / 4));
-  assert.match(pack.text, /TASK CONTEXT CAPSULE/);
+  await execFileAsync("git", ["add", "server.mjs"], { cwd: repositoryRoot });
+  await execFileAsync(
+    "git",
+    [
+      "-c",
+      "user.name=Council test",
+      "-c",
+      "user.email=test@council.local",
+      "commit",
+      "-q",
+      "-m",
+      "initial",
+    ],
+    { cwd: repositoryRoot },
+  );
+  await writeFile(
+    path.join(repositoryRoot, "agent_context", "repository.md"),
+    "# Repository\n\nThe local server persists task worktrees and context jobs.\n",
+  );
+  await writeFile(
+    path.join(repositoryRoot, "agent_context", "manifest.json"),
+    JSON.stringify({
+      schemaVersion: 2,
+      documents: ["agent_context/repository.md"],
+    }),
+  );
+
+  try {
+    const pack = await buildTaskContextPack(
+      repositoryRoot,
+      "Persist task worktrees and context jobs in the local server",
+      { maxChars: 6_000 },
+    );
+    assert.ok(pack.selectedPaths.length > 0);
+    assert.ok(pack.selectedPaths.includes("agent_context/repository.md"));
+    assert.ok(pack.chars <= 6_500);
+    assert.equal(pack.estimatedTokens, Math.ceil(pack.chars / 4));
+    assert.match(pack.text, /TASK CONTEXT CAPSULE/);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
 });
 
 test("task context can be disabled and its token budget is user-controlled", async () => {

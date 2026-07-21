@@ -176,11 +176,12 @@ async function runFile(executable, args, options = {}) {
 
 async function runFileWithInput(executable, args, input, options = {}) {
   const startedAt = Date.now();
+  const hasInput = input != null && input.length > 0;
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, {
       cwd: options.cwd,
       env: options.env ?? process.env,
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: [hasInput ? "pipe" : "ignore", "pipe", "pipe"],
     });
     options.onSpawn?.({ child, pid: child.pid, executable, args });
     let stdout = "";
@@ -236,7 +237,15 @@ async function runFileWithInput(executable, args, input, options = {}) {
       error.stderr = stderr;
       reject(error);
     });
-    child.stdin.end(input);
+    if (hasInput && child.stdin) {
+      child.stdin.on("error", (error) => {
+        // The command's close event reports its real exit status. A process
+        // that exits before consuming optional input can otherwise surface an
+        // uncaught EPIPE on Linux/Node 22.
+        if (error.code !== "EPIPE") reject(error);
+      });
+      child.stdin.end(input);
+    }
   });
 }
 
