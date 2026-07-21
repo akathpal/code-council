@@ -1,6 +1,6 @@
 # code-council
 
-![code-council logo](public/code-council-logo.png)
+![code-council — Better code through collective intelligence](public/code-council-banner.png)
 
 [![CI](https://github.com/akathpal/code-council/actions/workflows/ci.yml/badge.svg)](https://github.com/akathpal/code-council/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
