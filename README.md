@@ -118,6 +118,25 @@ npm run restart
 
 Press `Ctrl+C` in the terminal to stop code-council.
 
+### Check your setup
+
+Run the non-mutating Setup Doctor before connecting a repository:
+
+```bash
+npm run doctor
+```
+
+It checks the required Node.js, Git, `uv`, Graphify, and Codex setup, plus the
+optional Claude Code, GitHub CLI, and OpenHands integrations. Every failed or
+optional check includes a concrete repair command. Use JSON output in scripts:
+
+```bash
+node bin/council.mjs doctor --json
+```
+
+The same report is available from the **Doctor** button beside **Local
+runtime** in the app.
+
 ## Test it on a local repository
 
 1. Start code-council and open [http://localhost:3000](http://localhost:3000).
@@ -157,9 +176,23 @@ Press `Ctrl+C` in the terminal to stop code-council.
 9. Open the diff and choose **Accept**, **Decline**, or **Request changes**.
    Accepted changes are applied only after a patch preflight check.
 
-To compare the value of repository context, run the same task twice: once with
-the task-level **Context** toggle enabled and once with it disabled. Compare
-tokens, latency, selected context, test results, and the final diff in each task.
+To compare strategies or the value of repository context, enter a request and
+click **Compare**. The same automatic intent classifier used by normal sends
+decides whether the request is a read-only repository question or a coding
+task—there is no extra mode selector. Read-only comparisons run Codex and Claude
+against the same source snapshot without worktrees or patches. Coding
+comparisons run isolated variants from the same base SHA and remain
+review-gated. The parent tab displays calls, tokens, context tokens, agent time,
+the selected model and intelligence snapshots, and the relevant answer or patch
+evidence side by side. Choose the Codex and/or Claude model and supported
+intelligence level inside each variant before starting the comparison. Use
+**Open run** to
+inspect each child conversation (`C01`, `C02`, and so on) and **Back to
+comparison** to return to its parent task.
+
+If a run asks an irrelevant clarification, choose **Dismiss without rerun**.
+The run is closed and its history is preserved without calling an agent,
+changing repository files, or consuming more model quota.
 
 ## Verify the project
 

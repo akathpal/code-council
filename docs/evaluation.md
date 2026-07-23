@@ -4,6 +4,12 @@ code-council is only useful if teams can determine whether a council beats a sin
 
 ## Current instrumentation versus roadmap
 
+The alpha includes Council Replay, an interactive local comparison runner for
+two to four variants. It holds the task and base repository fingerprint
+constant, gives each variant an isolated worktree, and compares status, calls,
+tokens, context tokens, duration, cost, changed files, checks, and patches.
+Replay results use the same human review gate as ordinary coding tasks.
+
 The alpha records task strategy, models, reasoning, context policy, capsule
 budget and selected paths, Graphify status, per-call agent/stage/duration/cost,
 and reported-or-estimated token fields. It also persists accept, reject, and
@@ -16,8 +22,9 @@ and the token contribution of every selected memory document. The UI exposes
 this as **Context used**, so a benchmark result can be traced back to the exact
 retrieval decision rather than only its final prompt size.
 
-The alpha does **not** yet ship a benchmark runner, hidden-test harness,
-confidence calibrator, learned router, or aggregate dashboard. The metric and
+The alpha does **not** yet ship a batch benchmark suite, hidden-test harness,
+confidence calibrator, learned router, or aggregate dashboard. Council Replay
+is a hands-on A/B workflow, not an automated quality benchmark. The metric and
 policy sections below define the evaluation contract for those next releases;
 they are not claims about current production behavior.
 

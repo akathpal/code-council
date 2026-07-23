@@ -7,7 +7,8 @@ export type TaskCenterView =
   | "conversation"
   | "environment"
   | "monitor"
-  | "memory";
+  | "memory"
+  | "compare";
 
 export type TaskListFilter =
   | "active"
@@ -20,6 +21,7 @@ export type RepositoryUiState = {
   expandedFolders: string[];
   openFilePaths: string[];
   openTaskIds: string[];
+  openReplayIds: string[];
   openDiffTaskIds: string[];
   activeTabId: string | null;
   selectedTaskId: string | null;
@@ -62,7 +64,7 @@ function explorerWidth(value: unknown) {
 }
 
 function taskView(value: unknown): TaskCenterView {
-  return ["conversation", "environment", "monitor", "memory"].includes(
+  return ["conversation", "environment", "monitor", "memory", "compare"].includes(
     String(value),
   )
     ? (value as TaskCenterView)
@@ -82,6 +84,7 @@ export function createRepositoryUiState(): RepositoryUiState {
     expandedFolders: [...DEFAULT_EXPANDED_FOLDERS],
     openFilePaths: [],
     openTaskIds: [],
+    openReplayIds: [],
     openDiffTaskIds: [],
     activeTabId: null,
     selectedTaskId: null,
@@ -115,6 +118,7 @@ function normalizeRepositoryUiState(value: unknown): RepositoryUiState {
     expandedFolders,
     openFilePaths: stringList(value.openFilePaths),
     openTaskIds: stringList(value.openTaskIds),
+    openReplayIds: stringList(value.openReplayIds),
     openDiffTaskIds: stringList(value.openDiffTaskIds),
     activeTabId: stringOrNull(value.activeTabId),
     selectedTaskId: stringOrNull(value.selectedTaskId),

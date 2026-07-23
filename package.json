@@ -28,6 +28,7 @@
     "node": ">=22.13.0"
   },
   "scripts": {
+    "doctor": "node bin/council.mjs doctor",
     "dev": "node bin/council.mjs --dev",
     "restart": "node bin/council.mjs --restart",
     "web:dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev",

@@ -6,6 +6,11 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { promisify } from "node:util";
+import { detectLocalTools } from "../local/core.mjs";
+import {
+  buildSetupDoctorReport,
+  formatSetupDoctorReport,
+} from "../local/doctor.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const execFileAsync = promisify(execFile);
@@ -101,6 +106,30 @@ async function clearPidFile() {
     await readFile(pidFile, "utf8").catch(() => ""),
   );
   if (storedPid === process.pid) await unlink(pidFile).catch(() => {});
+}
+
+if (process.argv[2] === "doctor") {
+  const openHandsUrl =
+    process.env.COUNCIL_OPENHANDS_URL ?? "http://127.0.0.1:8001";
+  const [tools, openHandsReady] = await Promise.all([
+    detectLocalTools(),
+    fetch(`${openHandsUrl}/ready`, { signal: AbortSignal.timeout(1_500) })
+      .then((response) => response.ok)
+      .catch(() => false),
+  ]);
+  const report = buildSetupDoctorReport({
+    tools,
+    openHands: {
+      ready: openHandsReady,
+      version: "agent-canvas@1.5.0 / agent-server@1.36.1",
+    },
+  });
+  if (process.argv.includes("--json")) {
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  } else {
+    process.stdout.write(formatSetupDoctorReport(report));
+  }
+  process.exit(report.ready ? 0 : 1);
 }
 
 const existingLaunchers = await runningCouncilLaunchers();

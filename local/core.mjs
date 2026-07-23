@@ -45,6 +45,7 @@ const CLAUDE_REASONING = new Set(["low", "medium", "high", "xhigh", "max"]);
 const SAFE_MODEL = /^[a-zA-Z0-9][a-zA-Z0-9._:/[\]-]{0,99}$/;
 
 const VERSION_COMMANDS = {
+  git: ["--version"],
   codex: ["--version"],
   claude: ["--version"],
   gh: ["--version"],
@@ -69,6 +70,8 @@ const SMALL_TASK =
   /\b(typo|rename|copy|comment|format|lint|single test|one line|small)\b/i;
 const CODE_REQUEST =
   /\b(add|build|change|create|delete|edit|fix|implement|migrate|modify|refactor|remove|rename|replace|update|write)\b/i;
+const NEGATED_CODE_ACTION =
+  /\b(?:do not|don't|never)\b[^.!?;\n]*?(?=\bbut\b|[.!?;\n]|$)|\bwithout\s+(?:adding|building|changing|creating|deleting|editing|fixing|implementing|migrating|modifying|refactoring|removing|renaming|replacing|updating|writing)\b(?:\s+(?:any\s+)?(?:files?|code|source|the repository))?/gi;
 const CHAT_REQUEST =
   /^(hi|hello|hey|thanks|thank you)\b|^(can|could|do|does|explain|how|tell|what|when|where|which|why|would)\b/i;
 const SOCIAL_CHAT =
@@ -1301,7 +1304,8 @@ export function inferPromptIntent(prompt, requestedIntent = "auto") {
     return requestedIntent;
   }
   if (!normalized) return "chat";
-  if (CODE_REQUEST.test(normalized)) return "code";
+  const actionablePrompt = normalized.replace(NEGATED_CODE_ACTION, "");
+  if (CODE_REQUEST.test(actionablePrompt)) return "code";
   if (
     CHAT_REQUEST.test(normalized) ||
     normalized.endsWith("?") ||
@@ -2860,6 +2864,7 @@ function conversationMessage(role, content, details = {}) {
 export function normalizeTaskJob(job) {
   job.kind ??= "code";
   job.archivedAt ??= null;
+  job.replay ??= null;
   try {
     job.agentConfig = selectedAgentConfig(job.agentConfig ?? {});
   } catch {
@@ -3028,6 +3033,7 @@ export function createTaskJob(
     error: null,
     conflict: null,
     archivedAt: null,
+    replay: null,
     failedStage: null,
     attempt: 1,
   };
@@ -3174,6 +3180,14 @@ async function copyUntracked(repositoryRoot, worktreePath) {
 
 async function prepareTaskWorktree(job, options = {}) {
   const repository = await inspectRepository(job.repository);
+  if (
+    job.replay?.baseFingerprint &&
+    repository.fingerprint !== job.replay.baseFingerprint
+  ) {
+    throw new Error(
+      "The connected repository changed after this replay started. Start a new comparison so every variant uses the same source snapshot.",
+    );
+  }
   job.baseSha = repository.sha;
   job.baseFingerprint = repository.fingerprint;
   const rootHash = createHash("sha256")
@@ -3326,13 +3340,11 @@ ${CLARIFICATION_MARKER} <one concise question>
 Only ask when the answer would materially change the implementation.`;
 
 export function clarificationFromOutput(text) {
-  const value = String(text ?? "");
-  const marker = value.indexOf(CLARIFICATION_MARKER);
-  if (marker < 0) return null;
-  return value
-    .slice(marker + CLARIFICATION_MARKER.length)
-    .trim()
-    .slice(0, 2_000) || "What detail should I clarify before continuing?";
+  const value = String(text ?? "").trim();
+  if (!value.startsWith(CLARIFICATION_MARKER)) return null;
+  const question = value.slice(CLARIFICATION_MARKER.length).trim();
+  if (!question || question.includes("\n")) return null;
+  return question.slice(0, 2_000);
 }
 
 async function pauseForClarification(job, result, stage, agent, options) {
@@ -3401,6 +3413,31 @@ export async function answerTaskClarification(job, answer, options = {}) {
     at: now,
   });
   await options.onUpdate?.(job);
+  return job;
+}
+
+export async function dismissTaskClarification(job, options = {}) {
+  if (
+    job.kind !== "code" ||
+    job.status !== "awaiting_input" ||
+    job.clarification?.status !== "pending"
+  ) {
+    throw new Error("This task has no pending clarification to dismiss.");
+  }
+  const now = new Date().toISOString();
+  job.clarification.status = "dismissed";
+  job.clarification.dismissedAt = now;
+  job.clarification.answer = null;
+  job.cancelRequested = false;
+  job.error = null;
+  job.failedStage = null;
+  await cleanupTaskWorktree(job);
+  await updateJob(
+    job,
+    "canceled",
+    "Clarification dismissed without restarting agents or changing repository files.",
+    options,
+  );
   return job;
 }
 
