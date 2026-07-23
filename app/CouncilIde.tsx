@@ -142,6 +142,16 @@ type TaskJob = {
   createdAt: string;
   updatedAt: string;
   archivedAt?: string | null;
+  replay?: null | {
+    id: string;
+    label: string;
+    variantIndex: number;
+    totalVariants: number;
+    baseSha: string;
+    baseFingerprint: string;
+    intent?: "chat" | "code";
+    startedAt: string;
+  };
   decision: {
     strategy: Strategy;
     label: string;
@@ -153,11 +163,12 @@ type TaskJob = {
   events: JobEvent[];
   conversation?: ConversationMessage[];
   clarification?: null | {
-    status: "pending" | "answered";
+    status: "pending" | "answered" | "dismissed";
     question: string;
     stage: string;
     askedAt: string;
     answeredAt: string | null;
+    dismissedAt?: string | null;
     answer: string | null;
   };
   cancelRequested: boolean;
@@ -329,6 +340,31 @@ type Status = {
     preferred: null | { id: string; name: string };
   };
 };
+type DoctorCheck = {
+  id: string;
+  label: string;
+  status: "pass" | "warn" | "fail";
+  required: boolean;
+  detail: string;
+  version: string | null;
+  fix: string | null;
+};
+type DoctorReport = {
+  ready: boolean;
+  generatedAt: string;
+  summary: string;
+  counts: { pass: number; warn: number; fail: number };
+  checks: DoctorCheck[];
+};
+type ReplayVariantInput = {
+  label: string;
+  strategy: Strategy;
+  contextEnabled: boolean;
+  codexModel?: string;
+  claudeModel?: string;
+  codexReasoning?: string;
+  claudeReasoning?: string;
+};
 type RepositoryFile = {
   path: string;
   name: string;
@@ -367,7 +403,14 @@ type TreeNode = {
 type EditorTab =
   | { id: string; kind: "file"; title: string; file: RepositoryFile }
   | { id: string; kind: "diff"; title: string; taskId: string; iteration: number }
-  | { id: string; kind: "task"; title: string; taskId: string };
+  | { id: string; kind: "task"; title: string; taskId: string }
+  | {
+      id: string;
+      kind: "replay";
+      title: string;
+      replayId: string;
+      taskId: string;
+    };
 const FALLBACK_SETTINGS: Settings = {
   routingMode: "manual",
   strategy: "codex_only",
@@ -489,6 +532,17 @@ function compactDuration(milliseconds = 0) {
 }
 
 function taskWindowTitle(task: TaskJob, repositoryTasks: TaskJob[]) {
+  if (task.replay) {
+    const subject = task.prompt
+      .trim()
+      .replace(/\s+/g, " ")
+      .replace(/[.!?]+$/, "");
+    const summary =
+      subject.length > 22 ? `${subject.slice(0, 21).trimEnd()}…` : subject;
+    return `C${String(task.replay.variantIndex + 1).padStart(2, "0")} · ${
+      summary || "Untitled"
+    }`;
+  }
   const ordered = [...repositoryTasks].sort((left, right) =>
     left.createdAt.localeCompare(right.createdAt),
   );
@@ -506,6 +560,28 @@ function taskWindowTitle(task: TaskJob, repositoryTasks: TaskJob[]) {
   const summary =
     subject.length > 22 ? `${subject.slice(0, 21).trimEnd()}…` : subject;
   return `${prefix}${String(number).padStart(2, "0")} · ${summary || "Untitled"}`;
+}
+
+function replayWindowTitle(task: TaskJob, repositoryTasks: TaskJob[]) {
+  const ordered = [...repositoryTasks].sort((left, right) =>
+    left.createdAt.localeCompare(right.createdAt),
+  );
+  const topLevelKeys = [
+    ...new Set(
+      ordered.map((job) =>
+        job.replay ? `replay:${job.replay.id}` : `task:${job.id}`,
+      ),
+    ),
+  ];
+  const key = task.replay ? `replay:${task.replay.id}` : `task:${task.id}`;
+  const number = Math.max(1, topLevelKeys.indexOf(key) + 1);
+  const subject = task.prompt
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[.!?]+$/, "");
+  const summary =
+    subject.length > 22 ? `${subject.slice(0, 21).trimEnd()}…` : subject;
+  return `T${String(number).padStart(2, "0")} · ${summary || "Untitled"}`;
 }
 
 function taskAgentSettings(
@@ -1891,6 +1967,169 @@ function TaskMemory({
   );
 }
 
+function ReplayComparison({
+  replayId,
+  tasks,
+  onDismissClarification,
+  onOpenTask,
+  onReview,
+}: {
+  replayId: string;
+  tasks: TaskJob[];
+  onDismissClarification: (task: TaskJob) => void;
+  onOpenTask: (task: TaskJob) => void;
+  onReview: (task: TaskJob) => void;
+}) {
+  const variants = tasks
+    .filter((task) => task.replay?.id === replayId)
+    .sort(
+      (left, right) =>
+        (left.replay?.variantIndex ?? 0) - (right.replay?.variantIndex ?? 0),
+    );
+  const finished = variants.every((task) =>
+    [
+      "accepted",
+      "awaiting_review",
+      "canceled",
+      "completed",
+      "conflict",
+      "failed",
+      "rejected",
+    ].includes(task.status),
+  );
+  const baseline = variants[0]?.replay?.baseSha ?? variants[0]?.baseSha;
+  const readOnly = variants[0]?.kind === "chat";
+
+  return (
+    <section className="ide-task-panel ide-replay-panel" aria-label="Council replay comparison">
+      <header className="ide-task-panel-header">
+        <div>
+          <span>Council Replay</span>
+          <strong>{finished ? "Comparison ready" : "Running comparable tasks"}</strong>
+          <p>
+            Every variant reads {baseline?.slice(0, 12) ?? "the same snapshot"};{" "}
+            {readOnly
+              ? "answers stay read-only and create no worktrees."
+              : "neither patch changes the connected repository before review."}
+          </p>
+        </div>
+        <span className={`ide-replay-state ${finished ? "complete" : "running"}`}>
+          {variants.filter((task) => !taskIsActive(task)).length}/{variants.length}
+        </span>
+      </header>
+      <section className="ide-replay-prompt" aria-label="Original request">
+        <span>Original request</span>
+        <p>{variants[0]?.prompt ?? "Request unavailable"}</p>
+      </section>
+      <div className="ide-replay-grid">
+        {variants.map((task) => {
+          const usage = task.usage?.totals;
+          return (
+            <article className="ide-replay-card" key={task.id}>
+              <header>
+                <div>
+                  <span>Variant {(task.replay?.variantIndex ?? 0) + 1}</span>
+                  <strong>{task.replay?.label ?? task.decision.label}</strong>
+                </div>
+                <span className={`ide-status ${task.status}`}>{jobLabel(task)}</span>
+              </header>
+              <p>{task.decision.label}</p>
+              <div className="ide-replay-models" aria-label="Selected models">
+                {task.decision.strategy !== "claude_only" ? (
+                  <span>
+                    <b>C</b>
+                    {taskAgentSettings(task, "codex").model} ·{" "}
+                    {taskAgentSettings(task, "codex").reasoning}
+                  </span>
+                ) : null}
+                {task.decision.strategy !== "codex_only" ? (
+                  <span>
+                    <b>A</b>
+                    {taskAgentSettings(task, "claude").model} ·{" "}
+                    {taskAgentSettings(task, "claude").reasoning}
+                  </span>
+                ) : null}
+              </div>
+              <dl>
+                <div>
+                  <dt>Context</dt>
+                  <dd>{task.contextPolicy?.enabled === false ? "Off" : "On"}</dd>
+                </div>
+                <div>
+                  <dt>Agent calls</dt>
+                  <dd>{usage?.calls ?? 0}</dd>
+                </div>
+                <div>
+                  <dt>Tokens</dt>
+                  <dd>{compactTokens(usage?.totalTokens ?? 0)}</dd>
+                </div>
+                <div>
+                  <dt>Context tokens</dt>
+                  <dd>{compactTokens(usage?.contextTokens ?? 0)}</dd>
+                </div>
+                <div>
+                  <dt>Agent time</dt>
+                  <dd>{compactDuration(usage?.durationMs ?? 0)}</dd>
+                </div>
+                {readOnly ? (
+                  <div>
+                    <dt>Mode</dt>
+                    <dd>Read-only</dd>
+                  </div>
+                ) : (
+                  <div>
+                    <dt>Changed files</dt>
+                    <dd>{task.review?.files.length ?? 0}</dd>
+                  </div>
+                )}
+              </dl>
+              {task.review ? (
+                <div className="ide-replay-evidence">
+                  <strong>{task.review.stat}</strong>
+                  <small>{task.review.checks}</small>
+                </div>
+              ) : task.error ? (
+                <div className="ide-task-error">{task.error}</div>
+              ) : (
+                <div className="ide-replay-evidence pending">
+                  <strong>{task.stage.replaceAll("_", " ")}</strong>
+                  <small>{task.events.at(-1)?.message ?? "Waiting to start"}</small>
+                </div>
+              )}
+              <footer>
+                <button onClick={() => onOpenTask(task)} type="button">
+                  Open run
+                </button>
+                {task.status === "awaiting_input" ? (
+                  <button
+                    className="danger"
+                    onClick={() => onDismissClarification(task)}
+                    type="button"
+                  >
+                    Dismiss request
+                  </button>
+                ) : null}
+                {task.review ? (
+                  <button className="primary" onClick={() => onReview(task)} type="button">
+                    Review patch
+                  </button>
+                ) : null}
+              </footer>
+            </article>
+          );
+        })}
+      </div>
+      {!finished ? (
+        <p className="ide-replay-note">
+          {readOnly
+            ? "Results update automatically as each read-only answer records usage."
+            : "Results update automatically as each isolated task records usage and verification."}
+        </p>
+      ) : null}
+    </section>
+  );
+}
+
 export default function CouncilIde() {
   const [status, setStatus] = useState<Status | null>(null);
   const [repositories, setRepositories] = useState<Repository[]>([]);
@@ -1918,6 +2157,30 @@ export default function CouncilIde() {
   const [draftingNew, setDraftingNew] = useState(false);
   const [agentMenuOpen, setAgentMenuOpen] = useState(false);
   const [connectOpen, setConnectOpen] = useState(false);
+  const [doctorOpen, setDoctorOpen] = useState(false);
+  const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
+  const [replayOpen, setReplayOpen] = useState(false);
+  const [replayIntent, setReplayIntent] = useState<"chat" | "code" | null>(null);
+  const [replayVariants, setReplayVariants] = useState<ReplayVariantInput[]>([
+    {
+      label: "Codex only",
+      strategy: "codex_only",
+      contextEnabled: true,
+      codexModel: FALLBACK_SETTINGS.codex.model,
+      claudeModel: FALLBACK_SETTINGS.claude.model,
+      codexReasoning: FALLBACK_SETTINGS.codex.reasoning,
+      claudeReasoning: FALLBACK_SETTINGS.claude.reasoning,
+    },
+    {
+      label: "Codex + Claude council",
+      strategy: "council_plan_codex_execute",
+      contextEnabled: true,
+      codexModel: FALLBACK_SETTINGS.codex.model,
+      claudeModel: FALLBACK_SETTINGS.claude.model,
+      codexReasoning: FALLBACK_SETTINGS.codex.reasoning,
+      claudeReasoning: FALLBACK_SETTINGS.claude.reasoning,
+    },
+  ]);
   const [connectMode, setConnectMode] = useState<"local" | "github">("local");
   const [repositoryInput, setRepositoryInput] = useState("");
   const [contextMenuOpen, setContextMenuOpen] = useState(false);
@@ -2044,6 +2307,22 @@ export default function CouncilIde() {
       : settings.strategy === "claude_only"
         ? claudeReady
         : codexReady;
+  const replayNeedsCodex = replayVariants.some(
+    (variant) => variant.strategy !== "claude_only",
+  );
+  const replayNeedsClaude = replayVariants.some(
+    (variant) => variant.strategy !== "codex_only",
+  );
+  const replayCodexModels = modelEntries(
+    settingsOptions.codexCatalog,
+    settingsOptions.codexModels,
+    settings.codex.model,
+  );
+  const replayClaudeModels = modelEntries(
+    settingsOptions.claudeCatalog,
+    settingsOptions.claudeModels,
+    settings.claude.model,
+  );
   const replyingToTask =
     Boolean(selectedTask) &&
     !draftingNew &&
@@ -2274,9 +2553,44 @@ export default function CouncilIde() {
           )?.path === task.repository,
       );
       const restoredTabs: EditorTab[] = [];
+      const restoredReplayIds = new Set([
+        ...saved.openReplayIds,
+        ...saved.openTaskIds.flatMap((taskId) => {
+          const task = repositoryTaskList.find(
+            (candidate) => candidate.id === taskId,
+          );
+          return task?.replay && saved.taskViews[taskId] === "compare"
+            ? [task.replay.id]
+            : [];
+        }),
+      ]);
+      for (const replayId of restoredReplayIds) {
+        const task = repositoryTaskList
+          .filter((candidate) => candidate.replay?.id === replayId)
+          .sort(
+            (left, right) =>
+              (left.replay?.variantIndex ?? 0) -
+              (right.replay?.variantIndex ?? 0),
+          )[0];
+        if (!task?.replay) continue;
+        restoredTabs.push({
+          id: `replay:${replayId}`,
+          kind: "replay",
+          title: replayWindowTitle(task, repositoryTaskList),
+          replayId,
+          taskId: task.id,
+        });
+      }
       for (const taskId of saved.openTaskIds) {
         const task = repositoryTaskList.find((candidate) => candidate.id === taskId);
         if (!task) continue;
+        if (
+          task.replay &&
+          saved.taskViews[task.id] === "compare" &&
+          !saved.openReplayIds.includes(task.replay.id)
+        ) {
+          continue;
+        }
         restoredTabs.push({
           id: `task:${task.id}`,
           kind: "task",
@@ -2368,7 +2682,7 @@ export default function CouncilIde() {
   }, [selectedRepositoryId, treeRefreshKey]);
 
   useEffect(() => {
-    if (!selectedTask || draftingNew) return;
+    if (!selectedTask || draftingNew || activeTab?.kind === "replay") return;
     let canceled = false;
     queueMicrotask(() => {
       if (canceled) return;
@@ -2408,7 +2722,13 @@ export default function CouncilIde() {
     return () => {
       canceled = true;
     };
-  }, [draftingNew, repositoryTasks, selectedRepositoryId, selectedTask]);
+  }, [
+    activeTab?.kind,
+    draftingNew,
+    repositoryTasks,
+    selectedRepositoryId,
+    selectedTask,
+  ]);
 
   useEffect(() => {
     const task = selectedTask;
@@ -2529,6 +2849,112 @@ export default function CouncilIde() {
     setUiState((current) => ({ ...current, notificationsEnabled: true }));
   }
 
+  async function runDoctor() {
+    setDoctorOpen(true);
+    setBusy("doctor");
+    setError("");
+    try {
+      setDoctorReport(await localRequest<DoctorReport>("/v1/doctor"));
+    } catch (reason) {
+      setError(String((reason as Error).message ?? reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  function updateReplayVariant(
+    index: number,
+    update: Partial<ReplayVariantInput>,
+  ) {
+    setReplayVariants((current) =>
+      current.map((variant, position) =>
+        position === index ? { ...variant, ...update } : variant,
+      ),
+    );
+  }
+
+  async function openReplayDialog() {
+    if (!selectedRepository || !prompt.trim()) return;
+    setBusy("replay-intent");
+    setError("");
+    try {
+      const result = await localRequest<{ intent: "chat" | "code" }>(
+        "/v1/tasks/route",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            path: selectedRepository.path,
+            prompt: prompt.trim(),
+            intent: "auto",
+          }),
+        },
+      );
+      setReplayIntent(result.intent);
+      if (result.intent === "chat") {
+        setReplayVariants((current) =>
+          current.map((variant) =>
+            variant.strategy === "council_plan_codex_execute"
+              ? {
+                  ...variant,
+                  label:
+                    variant.label === "Codex + Claude council"
+                      ? "Claude only"
+                      : variant.label,
+                  strategy: "claude_only",
+                }
+              : variant,
+          ),
+        );
+      }
+      setReplayOpen(true);
+    } catch (reason) {
+      setError(String((reason as Error).message ?? reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function startReplay() {
+    if (!selectedRepository || !prompt.trim()) return;
+    setBusy("replay");
+    setError("");
+    try {
+      const result = await localRequest<{
+        intent: "chat" | "code";
+        jobs: TaskJob[];
+      }>(
+        "/v1/replays/start",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            path: selectedRepository.path,
+            prompt: prompt.trim(),
+            intent: "auto",
+            variants: replayVariants,
+            agentConfig: { codex: settings.codex, claude: settings.claude },
+          }),
+        },
+      );
+      const first = result.jobs[0];
+      setTasks((current) => [
+        ...result.jobs,
+        ...current.filter(
+          (task) => !result.jobs.some((candidate) => candidate.id === task.id),
+        ),
+      ]);
+      setPrompt("");
+      setReplayIntent(result.intent);
+      setReplayOpen(false);
+      if (first) {
+        openReplayWindow(first, [...repositoryTasks, ...result.jobs]);
+      }
+    } catch (reason) {
+      setError(String((reason as Error).message ?? reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function installAgent(agent: "codex" | "claude") {
     setBusy(`install:${agent}`);
     setError("");
@@ -2553,7 +2979,44 @@ export default function CouncilIde() {
     }
   }
 
-  function openTaskWindow(task: TaskJob) {
+  function openReplayWindow(
+    task: TaskJob,
+    taskList: TaskJob[] = repositoryTasks,
+  ) {
+    if (!task.replay) {
+      openTaskWindow(task);
+      return;
+    }
+    const replay = task.replay;
+    const id = `replay:${replay.id}`;
+    const tab: EditorTab = {
+      id,
+      kind: "replay",
+      title: replayWindowTitle(task, taskList),
+      replayId: replay.id,
+      taskId: task.id,
+    };
+    setTabs((current) =>
+      current.some((entry) => entry.id === id) ? current : [...current, tab],
+    );
+    setSelectedTaskId(task.id);
+    setDraftingNew(false);
+    setActiveTabId(id);
+    setTaskView("compare");
+    persistRepositoryWorkspace((current) => ({
+      ...current,
+      activeTabId: id,
+      selectedTaskId: task.id,
+      openReplayIds: current.openReplayIds.includes(replay.id)
+        ? current.openReplayIds
+        : [...current.openReplayIds, replay.id],
+    }));
+  }
+
+  function openTaskWindow(
+    task: TaskJob,
+    viewOverride?: TaskCenterView,
+  ) {
     const id = `task:${task.id}`;
     const tab: EditorTab = {
       id,
@@ -2567,7 +3030,14 @@ export default function CouncilIde() {
     setSelectedTaskId(task.id);
     setDraftingNew(false);
     setActiveTabId(id);
-    const savedView = selectedRepositoryUi.taskViews[task.id] ?? "conversation";
+    const requestedView =
+      viewOverride ??
+      selectedRepositoryUi.taskViews[task.id] ??
+      "conversation";
+    const savedView =
+      task.replay && requestedView === "compare"
+        ? "conversation"
+        : requestedView;
     setTaskView(savedView);
     persistRepositoryWorkspace((current) => ({
       ...current,
@@ -2576,6 +3046,7 @@ export default function CouncilIde() {
       openTaskIds: current.openTaskIds.includes(task.id)
         ? current.openTaskIds
         : [...current.openTaskIds, task.id],
+      taskViews: { ...current.taskViews, [task.id]: savedView },
     }));
   }
 
@@ -2616,30 +3087,41 @@ export default function CouncilIde() {
   function closeTab(id: string) {
     const index = tabs.findIndex((tab) => tab.id === id);
     const next = tabs.filter((tab) => tab.id !== id);
+    const fallback =
+      activeTabId === id
+        ? next[Math.max(0, index - 1)] ?? next[0] ?? null
+        : null;
     if (activeTabId === id) {
-      const fallback = next[Math.max(0, index - 1)] ?? next[0] ?? null;
       setActiveTabId(fallback?.id ?? null);
-      if (fallback?.kind === "task") {
+      if (fallback?.kind === "task" || fallback?.kind === "replay") {
         setSelectedTaskId(fallback.taskId);
         setDraftingNew(false);
+        setTaskView(
+          fallback.kind === "replay"
+            ? "compare"
+            : selectedRepositoryUi.taskViews[fallback.taskId] ?? "conversation",
+        );
       } else if (!fallback) {
         setSelectedTaskId(null);
         setDraftingNew(true);
+        setTaskView("conversation");
       }
     }
     setTabs(next);
-    setTaskView("conversation");
     persistRepositoryWorkspace((current) => ({
       ...current,
       activeTabId:
         activeTabId === id
-          ? next[Math.max(0, index - 1)]?.id ?? next[0]?.id ?? null
+          ? fallback?.id ?? null
           : current.activeTabId,
       openFilePaths: current.openFilePaths.filter(
         (path) => `file:${path}` !== id,
       ),
       openTaskIds: current.openTaskIds.filter(
         (taskId) => `task:${taskId}` !== id,
+      ),
+      openReplayIds: current.openReplayIds.filter(
+        (replayId) => `replay:${replayId}` !== id,
       ),
       openDiffTaskIds: current.openDiffTaskIds.filter(
         (taskId) => `diff:${taskId}` !== id,
@@ -2653,16 +3135,17 @@ export default function CouncilIde() {
     if (activeTabId && removed.has(activeTabId)) {
       const fallback = next.at(-1) ?? null;
       setActiveTabId(fallback?.id ?? null);
-      if (fallback?.kind === "task") {
+      if (fallback?.kind === "task" || fallback?.kind === "replay") {
         setSelectedTaskId(fallback.taskId);
         setDraftingNew(false);
+        setTaskView(fallback.kind === "replay" ? "compare" : "conversation");
       } else {
         setSelectedTaskId(null);
         setDraftingNew(!fallback);
+        setTaskView("conversation");
       }
     }
     setTabs(next);
-    setTaskView("conversation");
   }
 
   function beginNewTask() {
@@ -2871,6 +3354,34 @@ export default function CouncilIde() {
     try {
       await localRequest(`/v1/tasks/${selectedTask.id}/${action}`, { method: "POST" });
       await refreshAll();
+    } catch (reason) {
+      setError(String((reason as Error).message ?? reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function dismissClarification(task: TaskJob) {
+    if (
+      !window.confirm(
+        "Dismiss this clarification? The run will close without restarting agents or consuming more quota.",
+      )
+    ) {
+      return;
+    }
+    setBusy(`dismiss:${task.id}`);
+    setError("");
+    try {
+      const result = await localRequest<{ job: TaskJob }>(
+        `/v1/tasks/${task.id}/clarification/dismiss`,
+        { method: "POST" },
+      );
+      setPrompt("");
+      setTasks((current) =>
+        current.map((candidate) =>
+          candidate.id === result.job.id ? result.job : candidate,
+        ),
+      );
     } catch (reason) {
       setError(String((reason as Error).message ?? reason));
     } finally {
@@ -3337,9 +3848,16 @@ export default function CouncilIde() {
               </span>
             </div>
           </div>
-          <div>
+          <div className="ide-runtime-row">
             <span className={status?.ready ? "online" : ""} />
-            Local runtime
+            <strong>Local runtime</strong>
+            <button
+              disabled={busy === "doctor"}
+              onClick={() => void runDoctor()}
+              type="button"
+            >
+              {busy === "doctor" ? "Checking…" : "Doctor"}
+            </button>
           </div>
         </footer>
         <div
@@ -3662,10 +4180,16 @@ export default function CouncilIde() {
                 if (tab.kind === "task") {
                   setSelectedTaskId(tab.taskId);
                   setDraftingNew(false);
+                  const savedView =
+                    selectedRepositoryUi.taskViews[tab.taskId] ?? "conversation";
                   selectTaskCenterView(
-                    selectedRepositoryUi.taskViews[tab.taskId] ?? "conversation",
+                    savedView === "compare" ? "conversation" : savedView,
                     tab.taskId,
                   );
+                } else if (tab.kind === "replay") {
+                  setSelectedTaskId(tab.taskId);
+                  setDraftingNew(false);
+                  setTaskView("compare");
                 } else if (tab.kind === "diff") {
                   setSelectedTaskId(tab.taskId);
                   setDraftingNew(false);
@@ -3674,7 +4198,9 @@ export default function CouncilIde() {
                   ...current,
                   activeTabId: tab.id,
                   selectedTaskId:
-                    tab.kind === "task" || tab.kind === "diff"
+                    tab.kind === "task" ||
+                    tab.kind === "replay" ||
+                    tab.kind === "diff"
                       ? tab.taskId
                       : current.selectedTaskId,
                 }));
@@ -3689,6 +4215,8 @@ export default function CouncilIde() {
               <span className={tab.kind}>
                 {tab.kind === "diff"
                   ? "±"
+                  : tab.kind === "replay"
+                    ? "⇄"
                   : tab.kind === "task"
                     ? "◌"
                     : fileGlyph(tab.title)}
@@ -3728,42 +4256,72 @@ export default function CouncilIde() {
               }}
               task={diffTask}
             />
-          ) : activeTab?.kind === "task" && selectedTask && !draftingNew ? (
+          ) : (activeTab?.kind === "task" || activeTab?.kind === "replay") &&
+            selectedTask &&
+            !draftingNew ? (
             <section className="ide-task-workspace">
               <nav className="ide-task-nav" aria-label="Task workspace">
-                <button
-                  className={taskView === "conversation" ? "active" : ""}
-                  onClick={() => selectTaskCenterView("conversation")}
-                  type="button"
-                >
-                  Conversation
-                </button>
-                <button
-                  className={taskView === "environment" ? "active" : ""}
-                  onClick={() => selectTaskCenterView("environment")}
-                  type="button"
-                >
-                  Environment
-                  {selectedTask.review ? <span>{selectedTask.review.files.length}</span> : null}
-                </button>
-                <button
-                  className={taskView === "monitor" ? "active" : ""}
-                  onClick={() => selectTaskCenterView("monitor")}
-                  type="button"
-                >
-                  Monitor
-                  {selectedTask.processes.some((process) => process.status === "running") ? <i /> : null}
-                </button>
-                <button
-                  className={taskView === "memory" ? "active" : ""}
-                  onClick={() => selectTaskCenterView("memory")}
-                  type="button"
-                >
-                  Memory
-                </button>
+                {activeTab.kind === "task" ? (
+                  <>
+                    <button
+                      className={taskView === "conversation" ? "active" : ""}
+                      onClick={() => selectTaskCenterView("conversation")}
+                      type="button"
+                    >
+                      Conversation
+                    </button>
+                    <button
+                      className={taskView === "environment" ? "active" : ""}
+                      onClick={() => selectTaskCenterView("environment")}
+                      type="button"
+                    >
+                      Environment
+                      {selectedTask.review ? <span>{selectedTask.review.files.length}</span> : null}
+                    </button>
+                    <button
+                      className={taskView === "monitor" ? "active" : ""}
+                      onClick={() => selectTaskCenterView("monitor")}
+                      type="button"
+                    >
+                      Monitor
+                      {selectedTask.processes.some((process) => process.status === "running") ? <i /> : null}
+                    </button>
+                    <button
+                      className={taskView === "memory" ? "active" : ""}
+                      onClick={() => selectTaskCenterView("memory")}
+                      type="button"
+                    >
+                      Memory
+                    </button>
+                  </>
+                ) : null}
+                {selectedTask.replay ? (
+                  <button
+                    className={activeTab.kind === "replay" ? "active" : ""}
+                    onClick={() =>
+                      activeTab.kind === "replay"
+                        ? setTaskView("compare")
+                        : openReplayWindow(selectedTask)
+                    }
+                    type="button"
+                  >
+                    {activeTab.kind === "replay" ? "Comparison" : "Back to comparison"}
+                    <span>{selectedTask.replay.totalVariants}</span>
+                  </button>
+                ) : null}
               </nav>
               <div className="ide-task-view">
-                {taskView === "environment" && selectedRepository ? (
+                {activeTab.kind === "replay" && selectedTask.replay ? (
+                  <ReplayComparison
+                    onDismissClarification={(task) =>
+                      void dismissClarification(task)
+                    }
+                    onOpenTask={(task) => openTaskWindow(task, "conversation")}
+                    onReview={openReview}
+                    replayId={selectedTask.replay.id}
+                    tasks={tasks}
+                  />
+                ) : taskView === "environment" && selectedRepository ? (
                   <TaskEnvironment
                     ghAvailable={Boolean(status?.tools.gh?.available)}
                     onGitAction={(action) => void openTaskGitDialog(action)}
@@ -3905,6 +4463,19 @@ export default function CouncilIde() {
                   : "Continue chat"}
               </span>
             ) : null}
+            {selectedTask?.status === "awaiting_input" && !draftingNew ? (
+              <button
+                className="ide-dismiss-clarification"
+                disabled={busy === `dismiss:${selectedTask.id}`}
+                onClick={() => void dismissClarification(selectedTask)}
+                title="Close this run without restarting agents"
+                type="button"
+              >
+                {busy === `dismiss:${selectedTask.id}`
+                  ? "Dismissing…"
+                  : "Dismiss without rerun"}
+              </button>
+            ) : null}
             <div className="ide-agent-picker">
               <button
                 className="ide-agent-trigger"
@@ -3956,6 +4527,21 @@ export default function CouncilIde() {
                 {useContextForTask
                   ? `Context · ${compactTokens(taskContextBudget)}`
                   : "Context off"}
+              </button>
+            ) : null}
+            {!replyingToTask ? (
+              <button
+                className="ide-replay-trigger"
+                disabled={
+                  !selectedRepository ||
+                  !prompt.trim() ||
+                  busy === "replay-intent"
+                }
+                onClick={() => void openReplayDialog()}
+                title="Compare automatically inferred read-only or coding runs"
+                type="button"
+              >
+                {busy === "replay-intent" ? "Detecting…" : "Compare"}
               </button>
             ) : null}
             <span className="ide-context-hint">
@@ -4646,6 +5232,321 @@ export default function CouncilIde() {
                 <p>No matching commands or files.</p>
               ) : null}
             </div>
+          </section>
+        </div>
+      ) : null}
+
+      {doctorOpen ? (
+        <div className="ide-modal-backdrop">
+          <section
+            aria-label="Setup Doctor"
+            aria-modal="true"
+            className="ide-modal ide-doctor-modal"
+            role="dialog"
+          >
+            <button
+              aria-label="Close"
+              className="ide-modal-close"
+              onClick={() => setDoctorOpen(false)}
+              type="button"
+            >
+              ×
+            </button>
+            <span className="ide-modal-kicker">Local setup</span>
+            <h2>Setup Doctor</h2>
+            <p>
+              Non-mutating checks for the runtimes, agents, and local tools used by
+              code-council.
+            </p>
+            {busy === "doctor" && !doctorReport ? (
+              <div className="ide-doctor-loading" role="status">
+                <span className="ide-spinner" /> Inspecting local tools…
+              </div>
+            ) : doctorReport ? (
+              <>
+                <div className={`ide-doctor-summary ${doctorReport.ready ? "ready" : "blocked"}`}>
+                  <strong>{doctorReport.ready ? "Ready to run" : "Setup needs attention"}</strong>
+                  <span>{doctorReport.summary}</span>
+                  <small>
+                    {doctorReport.counts.pass} passed · {doctorReport.counts.warn} optional · {doctorReport.counts.fail} blocking
+                  </small>
+                </div>
+                <div className="ide-doctor-checks">
+                  {doctorReport.checks.map((check) => (
+                    <article className={check.status} key={check.id}>
+                      <span>{check.status === "pass" ? "✓" : check.status === "warn" ? "!" : "×"}</span>
+                      <div>
+                        <header>
+                          <strong>{check.label}</strong>
+                          {check.version ? <code>{check.version}</code> : null}
+                        </header>
+                        <p>{check.detail}</p>
+                        {check.fix ? <pre>{check.fix}</pre> : null}
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              </>
+            ) : null}
+            {error ? <div className="ide-error" role="alert">{error}</div> : null}
+            <footer>
+              <button onClick={() => setDoctorOpen(false)} type="button">
+                Close
+              </button>
+              <button
+                className="primary"
+                disabled={busy === "doctor"}
+                onClick={() => void runDoctor()}
+                type="button"
+              >
+                {busy === "doctor" ? "Checking…" : "Run again"}
+              </button>
+            </footer>
+          </section>
+        </div>
+      ) : null}
+
+      {replayOpen ? (
+        <div className="ide-modal-backdrop">
+          <section
+            aria-label="Council Replay"
+            aria-modal="true"
+            className="ide-modal ide-replay-modal"
+            role="dialog"
+          >
+            <button
+              aria-label="Close"
+              className="ide-modal-close"
+              onClick={() => setReplayOpen(false)}
+              type="button"
+            >
+              ×
+            </button>
+            <span className="ide-modal-kicker">Evaluation</span>
+            <h2>
+              {replayIntent === "chat"
+                ? "Compare read-only answers"
+                : replayIntent === "code"
+                  ? "Compare the same code change"
+                  : "Compare the same request"}
+            </h2>
+            <p>
+              {replayIntent === "chat"
+                ? "Both variants inspect the same source snapshot in read-only mode. No worktrees or patches are created."
+                : replayIntent === "code"
+                  ? "Both variants use the same source snapshot and separate worktrees. Review the patches before accepting either result."
+                  : "Intent is inferred automatically from the prompt when the comparison starts."}
+            </p>
+            <div
+              className={`ide-replay-intent ${
+                replayIntent === "chat" ? "chat" : replayIntent === "code" ? "code" : ""
+              }`}
+            >
+              <strong>
+                {replayIntent === "chat"
+                  ? "Read-only question"
+                  : replayIntent === "code"
+                    ? "Code change"
+                    : "Automatic intent"}
+              </strong>
+              <span>No mode selection required</span>
+            </div>
+            <label>
+              {replayIntent === "chat"
+                ? "Repository question"
+                : replayIntent === "code"
+                  ? "Coding task"
+                  : "Request"}
+              <textarea
+                onChange={(event) => {
+                  setPrompt(event.target.value);
+                  setReplayIntent(null);
+                }}
+                rows={4}
+                value={prompt}
+              />
+            </label>
+            <div className="ide-replay-variants">
+              {replayVariants.map((variant, index) => (
+                <fieldset key={index}>
+                  <legend>Variant {index + 1}</legend>
+                  <label>
+                    Label
+                    <input
+                      maxLength={80}
+                      onChange={(event) =>
+                        updateReplayVariant(index, { label: event.target.value })
+                      }
+                      value={variant.label}
+                    />
+                  </label>
+                  <label>
+                    Strategy
+                    <select
+                      onChange={(event) => {
+                        const strategy = event.target.value as Strategy;
+                        updateReplayVariant(index, {
+                          strategy,
+                          label:
+                            strategy === "codex_only"
+                              ? "Codex only"
+                              : strategy === "claude_only"
+                                ? "Claude only"
+                                : "Codex + Claude council",
+                        });
+                      }}
+                      value={variant.strategy}
+                    >
+                      <option value="codex_only">Codex only</option>
+                      <option value="claude_only">Claude only</option>
+                      {replayIntent !== "chat" ? (
+                        <option value="council_plan_codex_execute">
+                          Codex + Claude council
+                        </option>
+                      ) : null}
+                    </select>
+                  </label>
+                  {variant.strategy !== "claude_only" ? (
+                    <label>
+                      Codex model
+                      <select
+                        onChange={(event) => {
+                          const model = event.target.value;
+                          updateReplayVariant(index, {
+                            codexModel: model,
+                            codexReasoning: compatibleReasoning(
+                              settingsOptions.codexCatalog,
+                              model,
+                              variant.codexReasoning ?? settings.codex.reasoning,
+                              settingsOptions.codexReasoning,
+                            ),
+                          });
+                        }}
+                        value={variant.codexModel ?? settings.codex.model}
+                      >
+                        {replayCodexModels.map((entry) => (
+                          <option key={entry.model} value={entry.model}>
+                            {entry.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                  {variant.strategy !== "claude_only" ? (
+                    <label>
+                      Codex intelligence
+                      <select
+                        onChange={(event) =>
+                          updateReplayVariant(index, {
+                            codexReasoning: event.target.value,
+                          })
+                        }
+                        value={
+                          variant.codexReasoning ?? settings.codex.reasoning
+                        }
+                      >
+                        {reasoningEntries(
+                          settingsOptions.codexCatalog,
+                          variant.codexModel ?? settings.codex.model,
+                          settingsOptions.codexReasoning,
+                        ).map((reasoning) => (
+                          <option key={reasoning} value={reasoning}>
+                            {reasoning}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                  {variant.strategy !== "codex_only" ? (
+                    <label>
+                      Claude model
+                      <select
+                        onChange={(event) => {
+                          const model = event.target.value;
+                          updateReplayVariant(index, {
+                            claudeModel: model,
+                            claudeReasoning: compatibleReasoning(
+                              settingsOptions.claudeCatalog,
+                              model,
+                              variant.claudeReasoning ?? settings.claude.reasoning,
+                              settingsOptions.claudeReasoning,
+                            ),
+                          });
+                        }}
+                        value={variant.claudeModel ?? settings.claude.model}
+                      >
+                        {replayClaudeModels.map((entry) => (
+                          <option key={entry.model} value={entry.model}>
+                            {entry.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                  {variant.strategy !== "codex_only" ? (
+                    <label>
+                      Claude intelligence
+                      <select
+                        onChange={(event) =>
+                          updateReplayVariant(index, {
+                            claudeReasoning: event.target.value,
+                          })
+                        }
+                        value={
+                          variant.claudeReasoning ?? settings.claude.reasoning
+                        }
+                      >
+                        {reasoningEntries(
+                          settingsOptions.claudeCatalog,
+                          variant.claudeModel ?? settings.claude.model,
+                          settingsOptions.claudeReasoning,
+                        ).map((reasoning) => (
+                          <option key={reasoning} value={reasoning}>
+                            {reasoning}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                  <label className="ide-checkbox">
+                    <input
+                      checked={variant.contextEnabled}
+                      onChange={(event) =>
+                        updateReplayVariant(index, {
+                          contextEnabled: event.target.checked,
+                        })
+                      }
+                      type="checkbox"
+                    />
+                    Use repository context
+                  </label>
+                </fieldset>
+              ))}
+            </div>
+            {replayNeedsClaude && !claudeReady ? (
+              <div className="ide-task-error">
+                Authenticate Claude Code before starting a Claude or council variant.
+              </div>
+            ) : null}
+            {error ? <div className="ide-error" role="alert">{error}</div> : null}
+            <footer>
+              <button onClick={() => setReplayOpen(false)} type="button">
+                Cancel
+              </button>
+              <button
+                className="primary"
+                disabled={
+                  busy === "replay" ||
+                  !prompt.trim() ||
+                  (replayNeedsCodex && !codexReady) ||
+                  (replayNeedsClaude && !claudeReady)
+                }
+                onClick={() => void startReplay()}
+                type="button"
+              >
+                {busy === "replay" ? "Starting…" : "Start comparison"}
+              </button>
+            </footer>
           </section>
         </div>
       ) : null}

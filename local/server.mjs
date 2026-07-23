@@ -15,6 +15,7 @@ import {
   deleteTaskJob,
   detectEditors,
   detectLocalTools,
+  dismissTaskClarification,
   executeChatJob,
   executeTaskJob,
   generateContext,
@@ -51,6 +52,12 @@ import {
   loadCouncilState,
   saveCouncilState,
 } from "./store.mjs";
+import { buildSetupDoctorReport } from "./doctor.mjs";
+import {
+  createReplayPlan,
+  replayMetadata,
+  summarizeReplayJobs,
+} from "./replay.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.COUNCIL_LOCAL_PORT ?? 4781);
@@ -625,6 +632,19 @@ const server = createServer(async (request, response) => {
       );
     }
 
+    if (request.method === "GET" && url.pathname === "/v1/doctor") {
+      const [tools, runtime] = await Promise.all([
+        detectLocalTools(),
+        openHandsStatus(),
+      ]);
+      return send(
+        response,
+        200,
+        buildSetupDoctorReport({ tools, openHands: runtime }),
+        origin,
+      );
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/agents/install") {
       const payload = await body(request);
       const result = await installAgent(payload.agent);
@@ -856,12 +876,13 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && url.pathname === "/v1/tasks/route") {
       const payload = await body(request);
       const repository = await inspectRepository(payload.path);
+      const intent = inferPromptIntent(payload.prompt, payload.intent);
       const decision = routeTask(payload.prompt, {
         estimatedFiles: payload.estimatedFiles,
         risk: payload.risk,
         memoryFresh: repository.context.status === "fresh",
       });
-      return send(response, 200, { repository, decision }, origin);
+      return send(response, 200, { repository, decision, intent }, origin);
     }
 
     if (request.method === "GET" && url.pathname === "/v1/tasks") {
@@ -870,6 +891,89 @@ const server = createServer(async (request, response) => {
         url.searchParams.get("path"),
       ).map((job) => taskForResponse(job, true));
       return send(response, 200, { jobs }, origin);
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/replays") {
+      const repositoryPath = url.searchParams.get("path");
+      const jobs = [...taskJobs.values()].filter(
+        (job) => !repositoryPath || job.repository === repositoryPath,
+      );
+      return send(
+        response,
+        200,
+        { replays: summarizeReplayJobs(jobs) },
+        origin,
+      );
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/replays/start") {
+      const payload = await body(request);
+      const repository = await inspectRepository(payload.path);
+      const intent = inferPromptIntent(payload.prompt, payload.intent);
+      const plan = createReplayPlan({ ...payload, intent }, settings.context);
+      const agentConfig = validateAgentConfig(
+        payload.agentConfig ?? settings,
+      );
+      const jobs = plan.variants.map((variant, index) => {
+        const variantAgentConfig = validateAgentConfig({
+          codex: {
+            ...agentConfig.codex,
+            model: variant.models.codex ?? agentConfig.codex.model,
+            reasoning:
+              variant.reasoning.codex ?? agentConfig.codex.reasoning,
+          },
+          claude: {
+            ...agentConfig.claude,
+            model: variant.models.claude ?? agentConfig.claude.model,
+            reasoning:
+              variant.reasoning.claude ?? agentConfig.claude.reasoning,
+          },
+        });
+        const job =
+          intent === "chat"
+            ? createChatJob(
+                repository,
+                plan.prompt,
+                variant.strategy,
+                variantAgentConfig,
+                variant.contextPolicy,
+              )
+            : createTaskJob(
+                repository,
+                plan.prompt,
+                manualTaskDecision(variant.strategy, {
+                  memoryFresh: repository.context.status === "fresh",
+                }),
+                variantAgentConfig,
+                variant.contextPolicy,
+              );
+        job.replay = replayMetadata(plan, variant, index, repository);
+        taskJobs.set(job.id, job);
+        return job;
+      });
+      await persist();
+      const runtimeOptions = {
+        onUpdate: persist,
+        worktreeRoot: process.env.COUNCIL_WORKTREE_ROOT,
+        agentRuntime: processRuntime,
+      };
+      for (const job of jobs) {
+        if (job.kind === "chat") {
+          void executeChatJob(job, null, runtimeOptions);
+        } else if (job.status !== "awaiting_input") {
+          void executeTaskJob(job, runtimeOptions);
+        }
+      }
+      return send(
+        response,
+        202,
+        {
+          intent,
+          replay: summarizeReplayJobs(jobs)[0],
+          jobs: jobs.map((job) => taskForResponse(job)),
+        },
+        origin,
+      );
     }
 
     if (request.method === "POST" && url.pathname === "/v1/editor/open") {
@@ -1015,6 +1119,18 @@ const server = createServer(async (request, response) => {
         { job: taskForResponse(job) },
         origin,
       );
+    }
+
+    const dismissClarificationMatch = url.pathname.match(
+      /^\/v1\/tasks\/([^/]+)\/clarification\/dismiss$/,
+    );
+    if (request.method === "POST" && dismissClarificationMatch) {
+      const job = taskJobs.get(dismissClarificationMatch[1]);
+      if (!job) {
+        return send(response, 404, { error: "Task not found." }, origin);
+      }
+      await dismissTaskClarification(job, { onUpdate: persist });
+      return send(response, 200, { job: taskForResponse(job) }, origin);
     }
 
     const cancelMatch = url.pathname.match(/^\/v1\/tasks\/([^/]+)\/cancel$/);

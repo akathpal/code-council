@@ -75,3 +75,22 @@ test("malformed and older persisted values normalize without losing legacy selec
   ]);
   assert.doesNotThrow(() => parseCouncilUiState("{not-json"));
 });
+
+test("comparison views survive a serialized refresh", () => {
+  const state = createCouncilUiState();
+  state.repositories["repo-a"] = {
+    ...repositoryUiState(state, "repo-a"),
+    openReplayIds: ["replay-a"],
+    taskViews: { "task-a": "compare" },
+  };
+
+  const refreshed = parseCouncilUiState(JSON.stringify(state));
+  assert.deepEqual(
+    repositoryUiState(refreshed, "repo-a").openReplayIds,
+    ["replay-a"],
+  );
+  assert.equal(
+    repositoryUiState(refreshed, "repo-a").taskViews["task-a"],
+    "compare",
+  );
+});

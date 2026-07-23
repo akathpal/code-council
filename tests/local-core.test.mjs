@@ -25,6 +25,7 @@ import {
   createTaskCommit,
   createTaskJob,
   deleteTaskJob,
+  dismissTaskClarification,
   executeChatJob,
   executeTaskJob,
   generateContext,
@@ -189,6 +190,18 @@ test("auto intent separates read-only chat from coding work", () => {
     inferPromptIntent("Can you explain how repository context is used?"),
     "chat",
   );
+  assert.equal(
+    inferPromptIntent(
+      "Explain how requests reach the local runner. Do not modify any files or run write commands.",
+    ),
+    "chat",
+  );
+  assert.equal(
+    inferPromptIntent(
+      "Implement the parser fix without changing the public API.",
+    ),
+    "code",
+  );
   assert.equal(inferPromptIntent("Fix the context refresh bug"), "code");
   assert.equal(inferPromptIntent("hi", "code"), "chat");
   assert.equal(inferPromptIntent("Fix the context refresh bug", "code"), "code");
@@ -260,12 +273,44 @@ test("ambiguous coding tasks pause for clarification before agents run", async (
   assert.equal(job.conversation.at(-1).role, "user");
 });
 
+test("pending clarifications can be dismissed without restarting agents", async () => {
+  const repository = await inspectRepository(repositoryPath);
+  const job = createTaskJob(
+    repository,
+    "make it better",
+    manualTaskDecision("codex_only"),
+  );
+  const callsBeforeDismissal = job.usage.calls.length;
+
+  await dismissTaskClarification(job);
+
+  assert.equal(job.status, "canceled");
+  assert.equal(job.stage, "canceled");
+  assert.equal(job.clarification.status, "dismissed");
+  assert.equal(job.clarification.answer, null);
+  assert.match(job.clarification.dismissedAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(job.usage.calls.length, callsBeforeDismissal);
+  assert.match(job.events.at(-1).message, /without restarting agents/);
+});
+
 test("agents can explicitly pause a task for a discovered clarification", () => {
   assert.equal(
     clarificationFromOutput(
       "COUNCIL_CLARIFICATION: Should this preserve the legacy API response shape?",
     ),
     "Should this preserve the legacy API response shape?",
+  );
+  assert.equal(
+    clarificationFromOutput(
+      "The parser looks for COUNCIL_CLARIFICATION: followed by a concise question.",
+    ),
+    null,
+  );
+  assert.equal(
+    clarificationFromOutput(
+      "COUNCIL_CLARIFICATION: Which behavior should change?\nAdditional explanation.",
+    ),
+    null,
   );
   assert.equal(clarificationFromOutput("Implementation is ready."), null);
 });

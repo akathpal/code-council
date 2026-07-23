@@ -43,6 +43,8 @@ test("server-renders the local-first code-council workflow", async () => {
   assert.match(html, /Connect repository/i);
   assert.match(html, /Build context/i);
   assert.match(html, /Local runtime/i);
+  assert.match(html, /Doctor/i);
+  assert.match(html, /Compare/i);
   assert.match(html, /Switch to light mode/i);
   assert.doesNotMatch(html, /Prompt intent/i);
   assert.match(html, /aria-label="Open editor tabs"/i);
