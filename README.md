@@ -103,6 +103,39 @@ On first start, `uvx` downloads the pinned OpenHands Agent Server. Later starts
 reuse the local cache. Graphify runs locally against each connected repository;
 it does not use a model to build the structural graph.
 
+Make sure the active shell is using Node.js 22.13 or newer before installing or
+starting code-council:
+
+```bash
+node --version
+```
+
+If `npm start` fails while importing `glob` from `node:fs/promises`, an older
+Node.js executable is still first on `PATH`. Switch to Node.js 22.13 or newer,
+run `npm ci` again, and restart. If `uv --version` invokes a sandboxed Snap that
+cannot run, install the official standalone `uv` binary instead and confirm
+that its install directory appears before `/snap/bin` on `PATH`.
+
+On Ubuntu 20.04, the Cloudflare `workerd` binary cannot run against the
+system's glibc 2.31. If Docker and the Docker Compose plugin are installed,
+`npm start` detects this automatically and runs only the web runtime in a
+Debian Bookworm container. The local companion, OpenHands, repository paths,
+and agent CLI logins continue to run on the host. The first start downloads the
+Node image and installs the web dependencies into Docker-managed volumes, so it
+takes longer than later starts.
+
+Override runtime selection when troubleshooting:
+
+```bash
+COUNCIL_WEB_RUNTIME=container npm start
+COUNCIL_WEB_RUNTIME=native npm start
+```
+
+The supported values are `auto` (the default), `container`, and `native`.
+Container mode uses Linux host networking and is intended for older Linux
+hosts. Pressing `Ctrl+C` stops the attached container with the other
+code-council services.
+
 If an agent is not authenticated, sign in with its CLI and refresh the app:
 
 ```bash

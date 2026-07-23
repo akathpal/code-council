@@ -1,0 +1,7 @@
+FROM node:22.22.0-bookworm-slim
+
+WORKDIR /workspace
+
+COPY docker/web-entrypoint.sh /usr/local/bin/code-council-web
+
+ENTRYPOINT ["bash", "/usr/local/bin/code-council-web"]

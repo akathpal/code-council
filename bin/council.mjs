@@ -11,6 +11,8 @@ import {
   buildSetupDoctorReport,
   formatSetupDoctorReport,
 } from "../local/doctor.mjs";
+import { processAncestorIds } from "../local/launcher-processes.mjs";
+import { resolveWebRuntime } from "../local/web-runtime.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const execFileAsync = promisify(execFile);
@@ -49,6 +51,7 @@ async function processWorkingDirectory(pid) {
 
 async function runningCouncilLaunchers() {
   const candidates = new Set();
+  const ancestorPids = await processAncestorIds();
   const storedPid = Number(
     await readFile(pidFile, "utf8").catch(() => ""),
   );
@@ -79,7 +82,14 @@ async function runningCouncilLaunchers() {
 
   const matching = [];
   for (const pid of candidates) {
-    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
+    if (
+      !Number.isInteger(pid) ||
+      pid <= 0 ||
+      pid === process.pid ||
+      ancestorPids.has(pid)
+    ) {
+      continue;
+    }
     if (!processExists(pid)) continue;
     const cwd = await processWorkingDirectory(pid);
     if (cwd && path.resolve(cwd) === root) matching.push(pid);
@@ -146,6 +156,11 @@ if (process.argv.includes("--restart")) {
   );
   process.exit(1);
 }
+
+const webRuntime = await resolveWebRuntime({
+  override: process.env.COUNCIL_WEB_RUNTIME,
+  execFile: execFileAsync,
+});
 
 await mkdir(stateDirectory, { recursive: true });
 await writeFile(pidFile, `${process.pid}\n`, "utf8");
@@ -234,7 +249,21 @@ if (!openHandsReady && process.env.COUNCIL_SKIP_OPENHANDS !== "1") {
 }
 
 launch("local", process.execPath, [path.join(root, "local", "server.mjs")]);
-launch("web", "npm", ["run", "web:dev"]);
+if (webRuntime.kind === "container") {
+  console.log(
+    `[web] Using the containerized runtime (${webRuntime.reason}).`,
+  );
+  launch("web", "docker", [
+    "compose",
+    "-f",
+    "compose.ubuntu20.yml",
+    "up",
+    "--build",
+    "--remove-orphans",
+  ]);
+} else {
+  launch("web", "npm", ["run", "web:dev"]);
+}
 
 console.log("\nCouncil UI:       http://localhost:3000");
 console.log("OpenHands API:    http://localhost:8001");
