@@ -2,8 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { CopyPathButton } from "./copy-path-button";
-
-const LOCAL_API = "/local-api";
+import { localRequest } from "./local-request";
 
 type Tool = {
   id: string;
@@ -327,16 +326,6 @@ function compatibleReasoning(
   if (supported.includes("high")) return "high";
   if (supported.includes("medium")) return "medium";
   return supported[0] ?? current;
-}
-
-async function localRequest<T>(requestPath: string, options?: RequestInit) {
-  const response = await fetch(`${LOCAL_API}${requestPath}`, {
-    ...options,
-    headers: { "content-type": "application/json", ...options?.headers },
-  });
-  const payload = (await response.json()) as T & { error?: string };
-  if (!response.ok) throw new Error(payload.error ?? "Local request failed.");
-  return payload;
 }
 
 function shortTime(value: string) {

@@ -1,0 +1,19 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    environment:
+      COUNCIL_LOCAL_URL: http://127.0.0.1:4781
+      COUNCIL_WEB_CONTAINER: "1"
+    init: true
+    network_mode: host
+    stop_grace_period: 3s
+    volumes:
+      - .:/workspace
+      - council-web-node-modules:/workspace/node_modules
+      - council-web-npm-cache:/root/.npm
+
+volumes:
+  council-web-node-modules:
+  council-web-npm-cache:

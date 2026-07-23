@@ -16,6 +16,7 @@ import {
 } from "react";
 import { diffRows, diffRowText } from "./council-diff-rows";
 import { CopyPathButton } from "./copy-path-button";
+import { localRequest } from "./local-request";
 import {
   COUNCIL_UI_STATE_KEY,
   createCouncilUiState,
@@ -26,8 +27,6 @@ import {
   type TaskCenterView,
   type TaskListFilter,
 } from "./council-ui-state";
-
-const LOCAL_API = "/local-api";
 
 type Strategy = "codex_only" | "claude_only" | "council_plan_codex_execute";
 type AgentSettings = { model: string; reasoning: string };
@@ -446,16 +445,6 @@ const FALLBACK_OPTIONS: SettingsOptions = {
   claudeCatalog: [],
   discoveredAt: null,
 };
-
-async function localRequest<T>(requestPath: string, options?: RequestInit) {
-  const response = await fetch(`${LOCAL_API}${requestPath}`, {
-    ...options,
-    headers: { "content-type": "application/json", ...options?.headers },
-  });
-  const payload = (await response.json()) as T & { error?: string };
-  if (!response.ok) throw new Error(payload.error ?? "Local request failed.");
-  return payload;
-}
 
 class WorkspaceErrorBoundary extends Component<
   {

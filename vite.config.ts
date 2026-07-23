@@ -10,6 +10,9 @@ const { d1, r2 } = hostingConfig;
 
 // macOS Seatbelt blocks FSEvents, so Codex previews need polling for HMR.
 const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
+const isContainerizedWeb = process.env.COUNCIL_WEB_CONTAINER === "1";
+const localCompanionUrl =
+  process.env.COUNCIL_LOCAL_URL ?? "http://127.0.0.1:4781";
 
 const localBindingConfig = {
   main: "./worker/index.ts",
@@ -45,12 +48,13 @@ export default defineConfig(async () => {
 
   return {
     server: {
+      ...(isContainerizedWeb ? { host: "0.0.0.0" } : {}),
       ...(isCodexSeatbeltSandbox
         ? { watch: { useFsEvents: false, usePolling: true } }
         : {}),
       proxy: {
         "/local-api": {
-          target: "http://127.0.0.1:4781",
+          target: localCompanionUrl,
           changeOrigin: false,
           rewrite: (requestPath: string) =>
             requestPath.replace(/^\/local-api/, ""),
