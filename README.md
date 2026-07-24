@@ -71,6 +71,34 @@ reasoning. You can choose any other model and reasoning level reported by your
 installed Codex CLI. Changes stay isolated until you review and accept the
 diff.
 
+## Council IDE
+
+The repository now includes a thin Code-OSS workbench layer under
+[`ide/`](ide/README.md). It turns the existing local runtime into an editor
+experience without rewriting the trusted task engine:
+
+- **Council** opens the multi-agent Agent Manager, including stop, steer,
+  restart, goals, skills, worktrees, cost, evidence, and GitHub workflows.
+- **Codex** opens the separately installed official Codex extension.
+- **Claude Code** opens the separately installed official Claude Code
+  extension.
+- Editor selections and diagnostics can be handed to a prefilled Council task.
+- A status-bar attention indicator tracks running work and tasks that need
+  clarification, approval, review, or recovery.
+
+Build and package the extension:
+
+```bash
+npm run ide:build
+npm run ide:package
+```
+
+The package is written to `ide/build/council.vsix`. Council IDE uses Open VSX,
+where Codex and Claude Code are published under verified restricted namespaces.
+The provider extensions are referenced as an extension pack and opened as
+separate experiences; code-council does not redistribute their VSIX binaries.
+See the [Council IDE guide](ide/README.md) for preparing a Code-OSS checkout.
+
 ## Install
 
 ### Requirements
@@ -123,6 +151,9 @@ Debian Bookworm container. The local companion, OpenHands, repository paths,
 and agent CLI logins continue to run on the host. The first start downloads the
 Node image and installs the web dependencies into Docker-managed volumes, so it
 takes longer than later starts.
+If a healthy code-council web container is already running, later launcher
+starts reuse it instead of attempting a conflicting recreation; the source
+workspace remains bind-mounted for development updates.
 
 Override runtime selection when troubleshooting:
 
@@ -147,6 +178,12 @@ Use one command to stop an existing code-council process and start it again:
 
 ```bash
 npm run restart
+```
+
+Stop all services from another terminal:
+
+```bash
+npm run stop
 ```
 
 Press `Ctrl+C` in the terminal to stop code-council.
@@ -208,6 +245,42 @@ runtime** in the app.
    **Environment** for the branch, worktree, and change summary.
 9. Open the diff and choose **Accept**, **Decline**, or **Request changes**.
    Accepted changes are applied only after a patch preflight check.
+
+The composer is optimized for active development:
+
+- Press **Enter** to send and **Shift+Enter** for a newline.
+- Clicking back into the composer closes open model, skill, context, and GitHub
+  menus so typing is never obscured by configuration UI.
+- Use the persistent **Stop** control beside the composer to interrupt an active
+  agent. Type into the same composer to steer a running Codex or Claude turn
+  through the provider's native streaming interface; older provider versions
+  fall back to a linked stop-and-restart attempt with the update.
+- Failed or stopped tasks can retry the failed stage, restart from the
+  beginning, or use **Edit & restart** to revise the objective first.
+- Agent conversations persist across turns. Codex threads and Claude sessions
+  are resumed instead of rebuilding the entire conversation on every reply.
+
+For reusable workflows, open **Skills** beside the agent picker. The catalog is
+filtered to the selected routing strategy and labels each workflow as Codex or
+Claude. Auto mode lets each active provider discover its own repository, user,
+plugin, admin, or built-in skills. Explicit mode records selections with the
+task, sends Codex skills as typed app-server inputs, and preloads Claude skills
+through a task-scoped native agent configuration.
+
+Enable **Goal** for longer coding objectives. Goal mode stores the objective,
+provider thread, worktree, token budget, progress, and continuation history.
+It can be paused, resumed after an app restart, edited, or cleared. Automatic
+continuation is bounded by both the selected token budget and a per-run safety
+limit; it does not expand the task's sandbox or approval policy. Codex uses
+thread goals and Claude uses its native `/goal` evaluator loop. Both providers
+retain their local session and isolated worktree across pause and resume.
+
+When the connected repository has a GitHub origin and `gh` is authenticated,
+the **GitHub** workspace in the top bar lists open issues and pull requests,
+including review and check summaries. Start an issue as a bounded goal, review
+a pull request, or create a fix task for failing checks. Accepted patches can
+still be committed, pushed, and opened as draft pull requests from
+**Environment**.
 
 To compare strategies or the value of repository context, enter a request and
 click **Compare**. The same automatic intent classifier used by normal sends

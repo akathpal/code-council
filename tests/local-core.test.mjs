@@ -38,10 +38,13 @@ import {
   openFileInEditor,
   parseClaudeModelList,
   parseClaudeUsageOutput,
+  readClaudeSkills,
   readRepositoryFile,
   retryTaskJob,
+  updateActiveTaskJob,
   reviseTaskJob,
   routeTask,
+  summarizeGitHubChecks,
   validateAgentConfig,
   validateContextConfig,
   validateTaskContextPolicy,
@@ -1066,6 +1069,25 @@ test("GitHub connections reject non-GitHub and ambiguous repository URLs", async
   );
 });
 
+test("GitHub check summaries distinguish passing, pending, failing, and skipped checks", () => {
+  assert.deepEqual(
+    summarizeGitHubChecks([
+      { conclusion: "SUCCESS" },
+      { status: "IN_PROGRESS" },
+      { conclusion: "FAILURE" },
+      { conclusion: "SKIPPED" },
+      { state: "NEUTRAL" },
+    ]),
+    {
+      total: 5,
+      pending: 1,
+      passing: 2,
+      failing: 1,
+      skipped: 1,
+    },
+  );
+});
+
 test("task jobs snapshot selected models for durable background execution", async () => {
   const repository = await inspectRepository(repositoryPath);
   const job = createTaskJob(
@@ -1082,6 +1104,187 @@ test("task jobs snapshot selected models for durable background execution", asyn
   assert.equal(job.agentConfig.claude.reasoning, "xhigh");
   assert.deepEqual(job.processes, []);
   assert.equal(job.approval, null);
+});
+
+test("task jobs preserve explicit skills, durable goals, and attempt history", async () => {
+  const repository = await inspectRepository(repositoryPath);
+  const job = createTaskJob(
+    repository,
+    "Implement the bounded goal",
+    manualTaskDecision("codex_only"),
+    {},
+    {},
+    {
+      skills: {
+        mode: "explicit",
+        selected: [
+          {
+            name: "test-skill",
+            path: "/tmp/test-skill/SKILL.md",
+            scope: "user",
+            description: "Test workflow",
+          },
+        ],
+      },
+      goal: {
+        enabled: true,
+        tokenBudget: 12_000,
+        maxContinuations: 3,
+      },
+    },
+  );
+
+  assert.equal(job.skills.mode, "explicit");
+  assert.equal(job.skills.selected[0].name, "test-skill");
+  assert.equal(job.goal.objective, "Implement the bounded goal");
+  assert.equal(job.goal.tokenBudget, 12_000);
+  assert.equal(job.goal.maxContinuations, 3);
+  assert.equal(job.attempts.length, 1);
+  assert.equal(job.attempts[0].number, 1);
+
+  job.status = "running";
+  await updateActiveTaskJob(job, "Keep the public API stable");
+  assert.equal(job.conversation.at(-1).kind, "steering");
+  assert.equal(job.restartRequested, null);
+
+  await updateActiveTaskJob(job, "Also update the tests", { restart: true });
+  assert.equal(job.cancelRequested, true);
+  assert.match(job.prompt, /Also update the tests/);
+  assert.equal(job.restartRequested.message, "Also update the tests");
+});
+
+test("Claude skills are discovered from project and user Agent Skills", async () => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "council-claude-skills-"));
+  const repositoryRoot = path.join(temporary, "repository");
+  const claudeRoot = path.join(temporary, "claude");
+  try {
+    await mkdir(
+      path.join(repositoryRoot, ".claude", "skills", "project-review"),
+      { recursive: true },
+    );
+    await mkdir(path.join(claudeRoot, "skills", "user-ship"), {
+      recursive: true,
+    });
+    await writeFile(
+      path.join(
+        repositoryRoot,
+        ".claude",
+        "skills",
+        "project-review",
+        "SKILL.md",
+      ),
+      "---\nname: project-review\ndescription: Review project changes.\n---\n",
+    );
+    await writeFile(
+      path.join(claudeRoot, "skills", "user-ship", "SKILL.md"),
+      "---\nname: user-ship\ndescription: Ship verified changes.\n---\n",
+    );
+
+    const catalog = await readClaudeSkills(repositoryRoot, {
+      claudeConfigDir: claudeRoot,
+      includePlugins: false,
+    });
+
+    assert.equal(catalog.provider, "claude");
+    assert.deepEqual(
+      catalog.skills.map((skill) => [
+        skill.name,
+        skill.provider,
+        skill.scope,
+      ]),
+      [
+        ["project-review", "claude", "repo"],
+        ["user-ship", "claude", "user"],
+      ],
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("goal mode reuses the Codex thread and stops when the native goal completes", async () => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "council-goal-"));
+  const repositoryRoot = path.join(temporary, "repository");
+  const worktreeRoot = path.join(temporary, "worktrees");
+  await mkdir(repositoryRoot);
+  await execFileAsync("git", ["init", "-q"], { cwd: repositoryRoot });
+  await writeFile(path.join(repositoryRoot, "README.md"), "# Before\n", "utf8");
+  await execFileAsync("git", ["add", "README.md"], { cwd: repositoryRoot });
+  await execFileAsync(
+    "git",
+    [
+      "-c",
+      "user.name=Council test",
+      "-c",
+      "user.email=test@council.local",
+      "commit",
+      "-q",
+      "-m",
+      "initial",
+    ],
+    { cwd: repositoryRoot },
+  );
+
+  const calls = [];
+  try {
+    const repository = await inspectRepository(repositoryRoot);
+    const job = createTaskJob(
+      repository,
+      "Update the README using goal mode",
+      manualTaskDecision("codex_only"),
+      {},
+      {},
+      {
+        skills: {
+          mode: "explicit",
+          selected: [
+            {
+              name: "docs",
+              path: "/tmp/docs/SKILL.md",
+              scope: "user",
+            },
+          ],
+        },
+        goal: {
+          enabled: true,
+          tokenBudget: 10_000,
+          maxContinuations: 3,
+        },
+      },
+    );
+    await executeTaskJob(job, {
+      worktreeRoot,
+      codexRunner: async (cwd, prompt, sandbox, options) => {
+        calls.push({ prompt, sandbox, options });
+        await writeFile(path.join(cwd, "README.md"), "# After\n", "utf8");
+        const complete = calls.length === 2;
+        return {
+          text: complete ? "Goal complete." : "Continuing.",
+          durationMs: 1,
+          threadId: "thread-test",
+          turnId: `turn-${calls.length}`,
+          goal: {
+            objective: "Update the README using goal mode",
+            status: complete ? "complete" : "active",
+            tokenBudget: 10_000,
+            tokensUsed: complete ? 2_000 : 1_000,
+            timeUsedSeconds: calls.length,
+          },
+        };
+      },
+    });
+
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].sandbox, "workspace-write");
+    assert.equal(calls[0].options.skills[0].name, "docs");
+    assert.equal(calls[1].options.threadId, "thread-test");
+    assert.match(calls[1].prompt, /Continue working toward the active goal/);
+    assert.equal(job.goal.status, "complete");
+    assert.equal(job.agentSessions.codex.threadId, "thread-test");
+    assert.equal(job.status, "awaiting_review");
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
 });
 
 test("task execution stays isolated until its patch is accepted", async () => {
@@ -1351,7 +1554,7 @@ test("a failed activity can retry from its durable task stage", async () => {
   }
 });
 
-test("Claude-only execution writes in an isolated worktree", async () => {
+test("Claude-only execution uses native skills and durable goal state", async () => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "council-claude-task-"));
   const repositoryRoot = path.join(temporary, "repository");
   const worktreeRoot = path.join(temporary, "worktrees");
@@ -1380,22 +1583,92 @@ test("Claude-only execution writes in an isolated worktree", async () => {
       repository,
       "Update the README with Claude",
       manualTaskDecision("claude_only"),
+      {},
+      {},
+      {
+        skills: {
+          mode: "explicit",
+          selected: [
+            {
+              provider: "claude",
+              name: "project-review",
+              invocation: "project-review",
+              path: path.join(
+                repositoryRoot,
+                ".claude",
+                "skills",
+                "project-review",
+                "SKILL.md",
+              ),
+              scope: "repo",
+            },
+          ],
+        },
+        goal: {
+          enabled: true,
+          tokenBudget: 10_000,
+          maxContinuations: 4,
+        },
+      },
     );
     let sandboxMode = "";
+    let claudeSessionId = "";
     await executeTaskJob(job, {
       worktreeRoot,
-      claudeRunner: async (cwd, prompt, sandbox) => {
+      claudeRunner: async (cwd, prompt, sandbox, options) => {
         sandboxMode = sandbox;
+        claudeSessionId = options.sessionId;
+        assert.equal(options.resumeSession, false);
+        assert.equal(options.skills[0].name, "project-review");
+        assert.equal(options.goal.objective, "Update the README with Claude");
+        assert.equal(options.goal.maxContinuations, 4);
         assert.match(prompt, /Update the README with Claude/);
         await writeFile(path.join(cwd, "README.md"), "# Claude\n");
-        return { text: "Changed README.md", durationMs: 1 };
+        return {
+          text: "Changed README.md",
+          durationMs: 1,
+          usage: { totalTokens: 500 },
+        };
       },
     });
 
     assert.equal(sandboxMode, "workspace-write");
+    assert.match(claudeSessionId, /^[0-9a-f-]{36}$/);
+    assert.equal(job.agentSessions.claude.sessionId, claudeSessionId);
+    assert.equal(job.goal.provider, "claude");
+    assert.equal(job.goal.native, true);
+    assert.equal(job.goal.status, "complete");
+    assert.equal(job.goal.tokensUsed, 500);
     assert.equal(job.status, "awaiting_review");
     assert.deepEqual(job.review.files, ["README.md"]);
     assert.equal(await readFile(path.join(repositoryRoot, "README.md"), "utf8"), "# Before\n");
+
+    const budgetJob = createTaskJob(
+      repository,
+      "Keep working until the Claude budget is reached",
+      manualTaskDecision("claude_only"),
+      {},
+      {},
+      {
+        goal: {
+          enabled: true,
+          tokenBudget: 1_000,
+        },
+      },
+    );
+    await executeTaskJob(budgetJob, {
+      worktreeRoot,
+      claudeRunner: async () => {
+        const error = new Error("Claude stream reached the Council token budget.");
+        error.budgetExceeded = true;
+        error.tokensUsed = 1_000;
+        throw error;
+      },
+    });
+    assert.equal(budgetJob.status, "paused");
+    assert.equal(budgetJob.goal.status, "budgetLimited");
+    assert.equal(budgetJob.goal.tokensUsed, 1_000);
+    assert.ok(budgetJob.workspace?.path);
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

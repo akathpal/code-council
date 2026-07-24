@@ -36,7 +36,7 @@ test("Council persists repositories, settings, tasks, and context jobs together"
     });
 
     const restored = await loadCouncilState();
-    assert.equal(restored.schemaVersion, 2);
+    assert.equal(restored.schemaVersion, 3);
     assert.equal(restored.repositories[0].id, "repo-1");
     assert.equal(restored.settings.codex.model, "gpt-5.6-terra");
     assert.equal(restored.settings.claude.model, "claude-opus-4-8");
@@ -47,7 +47,7 @@ test("Council persists repositories, settings, tasks, and context jobs together"
     const raw = JSON.parse(
       await readFile(path.join(directory, "state.json"), "utf8"),
     );
-    assert.equal(raw.schemaVersion, 2);
+    assert.equal(raw.schemaVersion, 3);
   } finally {
     if (previous == null) delete process.env.COUNCIL_STATE_DIR;
     else process.env.COUNCIL_STATE_DIR = previous;

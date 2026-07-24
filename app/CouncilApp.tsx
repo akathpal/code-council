@@ -1,3 +1,4 @@
+/* eslint-disable @next/next/no-img-element -- Vinext serves this bundled logo directly; Next image optimization is unavailable in this runtime. */
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";

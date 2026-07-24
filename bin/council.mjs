@@ -143,6 +143,21 @@ if (process.argv[2] === "doctor") {
 }
 
 const existingLaunchers = await runningCouncilLaunchers();
+if (process.argv[2] === "stop") {
+  if (!existingLaunchers.length) {
+    console.log("code-council is not running.");
+    await unlink(pidFile).catch(() => {});
+    process.exit(0);
+  }
+  console.log(
+    `Stopping code-council (PID${existingLaunchers.length === 1 ? "" : "s"} ${existingLaunchers.join(", ")})…`,
+  );
+  await Promise.all(existingLaunchers.map(stopProcess));
+  await unlink(pidFile).catch(() => {});
+  console.log("code-council stopped.");
+  process.exit(0);
+}
+
 if (process.argv.includes("--restart")) {
   if (existingLaunchers.length) {
     console.log(
@@ -172,6 +187,24 @@ async function reachable(url) {
   } catch {
     return false;
   }
+}
+
+async function containerWebRunning() {
+  const result = await execFileAsync(
+    "docker",
+    [
+      "compose",
+      "-f",
+      "compose.ubuntu20.yml",
+      "ps",
+      "--status",
+      "running",
+      "--quiet",
+      "web",
+    ],
+    { cwd: root, timeout: 5_000 },
+  ).catch(() => null);
+  return Boolean(result?.stdout.trim());
 }
 
 function launch(label, executable, args, env = {}) {
@@ -253,14 +286,18 @@ if (webRuntime.kind === "container") {
   console.log(
     `[web] Using the containerized runtime (${webRuntime.reason}).`,
   );
-  launch("web", "docker", [
-    "compose",
-    "-f",
-    "compose.ubuntu20.yml",
-    "up",
-    "--build",
-    "--remove-orphans",
-  ]);
+  if (await containerWebRunning()) {
+    console.log("[web] Reusing the container already running on port 3000.");
+  } else {
+    launch("web", "docker", [
+      "compose",
+      "-f",
+      "compose.ubuntu20.yml",
+      "up",
+      "--build",
+      "--remove-orphans",
+    ]);
+  }
 } else {
   launch("web", "npm", ["run", "web:dev"]);
 }

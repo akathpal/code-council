@@ -1,3 +1,4 @@
+/* eslint-disable @next/next/no-img-element -- Vinext serves these bundled logos directly; Next image optimization is unavailable in this runtime. */
 "use client";
 
 import {
@@ -128,6 +129,65 @@ type ConversationMessage = {
   kind?: string;
   agent?: "codex" | "claude";
 };
+type SkillOption = {
+  provider: "codex" | "claude";
+  name: string;
+  invocation?: string;
+  path: string;
+  scope: "user" | "repo" | "system" | "admin" | "plugin";
+  description: string;
+  enabled: boolean;
+  dependencies?: { tools?: Array<{ type: string; value: string }> } | null;
+};
+type SkillCatalog = {
+  provider: "all";
+  cwd: string;
+  skills: SkillOption[];
+  errors: Array<{ path: string; message: string }>;
+  providers?: {
+    codex: Omit<SkillCatalog, "provider" | "providers"> & {
+      provider: "codex";
+    };
+    claude: Omit<SkillCatalog, "provider" | "providers"> & {
+      provider: "claude";
+    };
+  };
+};
+type GitHubWorkspace = {
+  repository: {
+    nameWithOwner: string;
+    url: string;
+    description: string;
+    defaultBranch: string;
+  };
+  issues: Array<{
+    number: number;
+    title: string;
+    body: string;
+    url: string;
+    labels: string[];
+    assignees: string[];
+    updatedAt: string;
+  }>;
+  pullRequests: Array<{
+    number: number;
+    title: string;
+    url: string;
+    isDraft: boolean;
+    headRefName: string;
+    baseRefName: string;
+    reviewDecision: string;
+    checks: {
+      total: number;
+      pending: number;
+      passing: number;
+      failing: number;
+      skipped: number;
+    };
+    updatedAt: string;
+  }>;
+  fetchedAt: string;
+};
 type TaskJob = {
   id: string;
   kind?: "chat" | "code";
@@ -173,6 +233,57 @@ type TaskJob = {
   cancelRequested: boolean;
   failedStage?: string | null;
   attempt?: number;
+  attempts?: Array<{
+    id: string;
+    number: number;
+    reason: string;
+    startStage: string;
+    status: string;
+    stage: string;
+    startedAt: string;
+    updatedAt: string;
+    endedAt: string | null;
+  }>;
+  skills?: {
+    mode: "auto" | "explicit";
+    selected: SkillOption[];
+  };
+  goal?: null | {
+    enabled: boolean;
+    provider: "codex" | "claude";
+    objective: string;
+    status:
+      | "active"
+      | "paused"
+      | "blocked"
+      | "usageLimited"
+      | "budgetLimited"
+      | "complete";
+    tokenBudget: number;
+    tokensUsed: number;
+    timeUsedSeconds: number;
+    autoContinue: boolean;
+    maxContinuations: number;
+    native?: boolean;
+    createdAt: string | number;
+    updatedAt: string | number;
+  };
+  agentSessions?: {
+    codex?: {
+      threadId: string;
+      turnId?: string | null;
+      stage: string;
+      status: string;
+      updatedAt: string;
+    };
+    claude?: {
+      sessionId: string;
+      stage: string;
+      status: string;
+      updatedAt: string;
+    };
+  };
+  pausedStage?: string | null;
   approval: null | {
     id: string;
     status: string;
@@ -1758,17 +1869,91 @@ function AgentPicker({
   );
 }
 
+function GoalBar({
+  task,
+  busy,
+  onClear,
+  onEdit,
+  onPause,
+  onResume,
+}: {
+  task: TaskJob;
+  busy: string;
+  onClear: () => void;
+  onEdit: () => void;
+  onPause: () => void;
+  onResume: () => void;
+}) {
+  const goal = task.goal;
+  if (!goal) return null;
+  const used = Math.max(0, Number(goal.tokensUsed ?? 0));
+  const budget = Math.max(1, Number(goal.tokenBudget ?? 1));
+  const progress = Math.min(100, Math.round((used / budget) * 100));
+  const active = ["queued", "running", "awaiting_approval"].includes(task.status);
+  return (
+    <section className={`ide-goal-bar ${goal.status}`} aria-label="Durable goal">
+      <div className="ide-goal-icon">◎</div>
+      <div className="ide-goal-copy">
+        <header>
+          <strong>
+            Goal · {goal.provider === "claude" ? "Claude" : "Codex"} ·{" "}
+            {goal.status.replace(/([A-Z])/g, " $1")}
+          </strong>
+          <span>
+            {compactTokens(used)} / {compactTokens(budget)} tokens
+            {goal.timeUsedSeconds
+              ? ` · ${compactDuration(goal.timeUsedSeconds * 1_000)}`
+              : ""}
+          </span>
+        </header>
+        <p>{goal.objective}</p>
+        <div className="ide-goal-progress">
+          <i style={{ width: `${progress}%` }} />
+        </div>
+      </div>
+      <div className="ide-goal-actions">
+        {active ? (
+          <button disabled={Boolean(busy)} onClick={onPause} type="button">
+            Pause
+          </button>
+        ) : task.status === "paused" ? (
+          <button
+            className="primary"
+            disabled={Boolean(busy)}
+            onClick={onResume}
+            type="button"
+          >
+            Resume
+          </button>
+        ) : null}
+        {!active ? (
+          <button disabled={Boolean(busy)} onClick={onEdit} type="button">
+            Edit
+          </button>
+        ) : null}
+        {!active ? (
+          <button disabled={Boolean(busy)} onClick={onClear} type="button">
+            Clear
+          </button>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
 function TaskMonitor({
   task,
   now,
   busy,
   onCancel,
+  onEditRestart,
   onRetry,
 }: {
   task: TaskJob;
   now: number;
   busy: string;
   onCancel: () => void;
+  onEditRestart: () => void;
   onRetry: (stage?: string) => void;
 }) {
   const active = ["queued", "running", "awaiting_approval"].includes(task.status);
@@ -1786,7 +1971,7 @@ function TaskMonitor({
             onClick={onCancel}
             type="button"
           >
-            {task.cancelRequested ? "Stopping…" : "Cancel task"}
+            {task.cancelRequested ? "Stopping…" : "Stop task"}
           </button>
         ) : null}
       </header>
@@ -1809,6 +1994,13 @@ function TaskMonitor({
               type="button"
             >
               Restart task
+            </button>
+            <button
+              disabled={busy.startsWith("retry:")}
+              onClick={onEditRestart}
+              type="button"
+            >
+              Edit &amp; restart
             </button>
           </div>
         ) : null}
@@ -2173,6 +2365,18 @@ export default function CouncilIde() {
   const [connectMode, setConnectMode] = useState<"local" | "github">("local");
   const [repositoryInput, setRepositoryInput] = useState("");
   const [contextMenuOpen, setContextMenuOpen] = useState(false);
+  const [skillCatalog, setSkillCatalog] = useState<SkillCatalog | null>(null);
+  const [skillMenuOpen, setSkillMenuOpen] = useState(false);
+  const [skillMode, setSkillMode] = useState<"auto" | "explicit">("auto");
+  const [selectedSkillPaths, setSelectedSkillPaths] = useState<string[]>([]);
+  const [skillError, setSkillError] = useState("");
+  const [githubMenuOpen, setGitHubMenuOpen] = useState(false);
+  const [githubWorkspace, setGitHubWorkspace] =
+    useState<GitHubWorkspace | null>(null);
+  const [githubError, setGitHubError] = useState("");
+  const [githubLoading, setGitHubLoading] = useState(false);
+  const [goalEnabled, setGoalEnabled] = useState(false);
+  const [goalTokenBudget, setGoalTokenBudget] = useState(50_000);
   const [useContextForTask, setUseContextForTask] = useState(
     FALLBACK_SETTINGS.context.enabledByDefault,
   );
@@ -2200,6 +2404,7 @@ export default function CouncilIde() {
   const tasksRef = useRef(tasks);
   const repositoriesRef = useRef(repositories);
   const previousTaskStatesRef = useRef<Map<string, string> | null>(null);
+  const workbenchHandoffHandledRef = useRef(false);
 
   useEffect(() => {
     uiStateRef.current = uiState;
@@ -2243,7 +2448,9 @@ export default function CouncilIde() {
     if (taskFilter === "archived") return archivedRepositoryTasks;
     return activeRepositoryTasks.filter((job) => {
       if (taskFilter === "needs_input") {
-        return ["awaiting_input", "awaiting_approval"].includes(job.status);
+        return ["awaiting_input", "awaiting_approval", "paused"].includes(
+          job.status,
+        );
       }
       if (taskFilter === "review") return job.status === "awaiting_review";
       if (taskFilter === "failed") {
@@ -2296,6 +2503,32 @@ export default function CouncilIde() {
       : settings.strategy === "claude_only"
         ? claudeReady
         : codexReady;
+  const taskSkillProviders = useMemo(
+    () =>
+      new Set<"codex" | "claude">(
+        settings.routingMode === "auto" ||
+        settings.strategy === "council_plan_codex_execute"
+          ? ["codex", "claude"]
+          : settings.strategy === "claude_only"
+            ? ["claude"]
+            : ["codex"],
+      ),
+    [settings.routingMode, settings.strategy],
+  );
+  const availableSkills = useMemo(
+    () =>
+      (skillCatalog?.skills ?? []).filter((skill) =>
+        taskSkillProviders.has(skill.provider),
+      ),
+    [skillCatalog, taskSkillProviders],
+  );
+  const selectedSkills = useMemo(
+    () =>
+      availableSkills.filter((skill) =>
+        selectedSkillPaths.includes(skill.path),
+      ),
+    [availableSkills, selectedSkillPaths],
+  );
   const replayNeedsCodex = replayVariants.some(
     (variant) => variant.strategy !== "claude_only",
   );
@@ -2318,10 +2551,11 @@ export default function CouncilIde() {
     activeTab?.kind === "task" &&
     activeTab.taskId === selectedTask?.id &&
     (selectedTask?.kind === "chat" ||
-      selectedTask?.status === "awaiting_input");
-  const selectedConversationBusy =
-    selectedTask?.kind === "chat" &&
-    ["queued", "running", "awaiting_approval"].includes(selectedTask.status);
+      selectedTask?.status === "awaiting_input" ||
+      ["queued", "running", "awaiting_approval"].includes(
+        selectedTask?.status ?? "",
+      ));
+  const selectedConversationBusy = false;
   const retrievalConfidence =
     selectedTask?.contextPack?.retrieval?.confidence ??
     selectedTask?.contextPack?.graphify?.confidence ??
@@ -2431,6 +2665,69 @@ export default function CouncilIde() {
   }, []);
 
   useEffect(() => {
+    if (
+      workbenchHandoffHandledRef.current ||
+      !uiStateHydrated ||
+      status === null
+    ) {
+      return;
+    }
+    let canceled = false;
+    queueMicrotask(() => {
+      if (canceled || workbenchHandoffHandledRef.current) return;
+      const parameters = new URLSearchParams(window.location.search);
+      const handoffPrompt = parameters.get("prompt")?.trim() ?? "";
+      const handoffRepository = parameters.get("repository")?.trim() ?? "";
+      const handoffView = parameters.get("view")?.trim() ?? "";
+      if (!handoffPrompt && !handoffRepository && !handoffView) {
+        workbenchHandoffHandledRef.current = true;
+        return;
+      }
+      const repository =
+        repositories.find(
+          (candidate) => candidate.path === handoffRepository,
+        ) ??
+        repositories[0] ??
+        null;
+      if (handoffRepository && !repository && repositories.length === 0) return;
+
+      workbenchHandoffHandledRef.current = true;
+      window.history.replaceState({}, "", window.location.pathname);
+      if (repository) setSelectedRepoId(repository.id);
+      if (handoffPrompt) {
+        setDraftingNew(true);
+        setSelectedTaskId(null);
+        setActiveTabId(null);
+        setTaskView("conversation");
+        setPrompt(handoffPrompt.slice(0, 20_000));
+        window.requestAnimationFrame(() => composerRef.current?.focus());
+      }
+      if (handoffView === "github" && repository) {
+        setGitHubMenuOpen(true);
+        setGitHubLoading(true);
+        setGitHubError("");
+        void localRequest<GitHubWorkspace>(
+          `/v1/repositories/${repository.id}/github`,
+        )
+          .then((workspace) => {
+            if (!canceled) setGitHubWorkspace(workspace);
+          })
+          .catch((reason) => {
+            if (!canceled) {
+              setGitHubError(String((reason as Error).message ?? reason));
+            }
+          })
+          .finally(() => {
+            if (!canceled) setGitHubLoading(false);
+          });
+      }
+    });
+    return () => {
+      canceled = true;
+    };
+  }, [repositories, status, uiStateHydrated]);
+
+  useEffect(() => {
     if (!uiStateHydrated) return;
     window.localStorage.setItem(COUNCIL_UI_STATE_KEY, JSON.stringify(uiState));
   }, [uiState, uiStateHydrated]);
@@ -2447,6 +2744,7 @@ export default function CouncilIde() {
       awaiting_input: "code-council needs clarification",
       awaiting_approval: "code-council needs approval",
       awaiting_review: "Patch ready for review",
+      paused: "Goal paused",
       failed: "code-council task failed",
       conflict: "Accepted patch has a conflict",
     };
@@ -2640,6 +2938,36 @@ export default function CouncilIde() {
       canceled = true;
     };
   }, [selectedRepositoryId]);
+
+  useEffect(() => {
+    let canceled = false;
+    queueMicrotask(() => {
+      if (canceled) return;
+      setSkillCatalog(null);
+      setSkillError("");
+      setSkillMode("auto");
+      setSelectedSkillPaths([]);
+      setSkillMenuOpen(false);
+      setGitHubMenuOpen(false);
+      setGitHubWorkspace(null);
+      setGitHubError("");
+      if (!selectedRepositoryId || (!codexReady && !claudeReady)) return;
+      void localRequest<SkillCatalog>(
+        `/v1/repositories/${selectedRepositoryId}/skills`,
+      )
+        .then((catalog) => {
+          if (!canceled) setSkillCatalog(catalog);
+        })
+        .catch((reason) => {
+          if (!canceled) {
+            setSkillError(String((reason as Error).message ?? reason));
+          }
+        });
+    });
+    return () => {
+      canceled = true;
+    };
+  }, [claudeReady, codexReady, selectedRepositoryId]);
 
   useEffect(() => {
     let canceled = false;
@@ -2849,6 +3177,61 @@ export default function CouncilIde() {
     } finally {
       setBusy("");
     }
+  }
+
+  async function toggleGitHubWorkspace() {
+    const opening = !githubMenuOpen;
+    if (opening) setContextMenuOpen(false);
+    setGitHubMenuOpen(opening);
+    if (
+      !opening ||
+      githubWorkspace ||
+      githubLoading ||
+      !selectedRepositoryId
+    ) {
+      return;
+    }
+    setGitHubLoading(true);
+    setGitHubError("");
+    try {
+      setGitHubWorkspace(
+        await localRequest<GitHubWorkspace>(
+          `/v1/repositories/${selectedRepositoryId}/github`,
+        ),
+      );
+    } catch (reason) {
+      setGitHubError(String((reason as Error).message ?? reason));
+    } finally {
+      setGitHubLoading(false);
+    }
+  }
+
+  async function refreshGitHubWorkspace() {
+    if (!selectedRepositoryId) return;
+    setGitHubLoading(true);
+    setGitHubError("");
+    try {
+      setGitHubWorkspace(
+        await localRequest<GitHubWorkspace>(
+          `/v1/repositories/${selectedRepositoryId}/github`,
+        ),
+      );
+    } catch (reason) {
+      setGitHubError(String((reason as Error).message ?? reason));
+    } finally {
+      setGitHubLoading(false);
+    }
+  }
+
+  function draftFromGitHub(
+    promptText: string,
+    options: { goal?: boolean } = {},
+  ) {
+    beginNewTask();
+    setPrompt(promptText);
+    setGoalEnabled(Boolean(options.goal));
+    setGitHubMenuOpen(false);
+    window.requestAnimationFrame(() => composerRef.current?.focus());
   }
 
   function updateReplayVariant(
@@ -3143,6 +3526,8 @@ export default function CouncilIde() {
     setActiveTabId(null);
     setTaskView("conversation");
     setUseContextForTask(settings.context.enabledByDefault !== false);
+    setGoalEnabled(false);
+    setGoalTokenBudget(50_000);
     setPrompt("");
     persistRepositoryWorkspace((current) => ({
       ...current,
@@ -3307,6 +3692,19 @@ export default function CouncilIde() {
                   tokenBudget: taskContextBudget,
                   graphify: settings.context.graphify,
                 },
+                skills: {
+                  mode: skillMode,
+                  selected: skillMode === "explicit" ? selectedSkills : [],
+                },
+                goal: goalEnabled
+                  ? {
+                      enabled: true,
+                      objective: taskPrompt,
+                      tokenBudget: goalTokenBudget,
+                      autoContinue: true,
+                      maxContinuations: 6,
+                    }
+                  : null,
               }),
             },
           );
@@ -3337,12 +3735,102 @@ export default function CouncilIde() {
     }
   }
 
+  function closeComposerMenus() {
+    setAgentMenuOpen(false);
+    setSkillMenuOpen(false);
+    setContextMenuOpen(false);
+    setGitHubMenuOpen(false);
+  }
+
   async function taskAction(action: "accept" | "reject" | "cancel") {
     if (!selectedTask) return;
     setBusy(action);
     try {
       await localRequest(`/v1/tasks/${selectedTask.id}/${action}`, { method: "POST" });
       await refreshAll();
+    } catch (reason) {
+      setError(String((reason as Error).message ?? reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function pauseOrResumeGoal(action: "pause" | "resume") {
+    if (!selectedTask?.goal) return;
+    setBusy(action);
+    setError("");
+    try {
+      const result = await localRequest<{ job: TaskJob }>(
+        `/v1/tasks/${selectedTask.id}/${action}`,
+        { method: "POST" },
+      );
+      setTasks((current) =>
+        current.map((task) => (task.id === result.job.id ? result.job : task)),
+      );
+      await refreshAll();
+    } catch (reason) {
+      setError(String((reason as Error).message ?? reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function editGoal(task: TaskJob) {
+    if (!task.goal) return;
+    const objective = window.prompt("Goal objective", task.goal.objective);
+    if (objective == null || !objective.trim()) return;
+    const budgetText = window.prompt(
+      "Token budget",
+      String(task.goal.tokenBudget),
+    );
+    if (budgetText == null) return;
+    const tokenBudget = Number(budgetText);
+    if (!Number.isFinite(tokenBudget) || tokenBudget < 1_000) {
+      setError("Goal token budget must be at least 1,000 tokens.");
+      return;
+    }
+    setBusy("goal-edit");
+    setError("");
+    try {
+      const result = await localRequest<{ job: TaskJob }>(
+        `/v1/tasks/${task.id}/goal`,
+        {
+          method: "POST",
+          body: JSON.stringify({ objective: objective.trim(), tokenBudget }),
+        },
+      );
+      setTasks((current) =>
+        current.map((candidate) =>
+          candidate.id === result.job.id ? result.job : candidate,
+        ),
+      );
+    } catch (reason) {
+      setError(String((reason as Error).message ?? reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function clearGoal(task: TaskJob) {
+    if (
+      !window.confirm(
+        "Clear this durable goal? A paused task will need to be restarted before continuing.",
+      )
+    ) {
+      return;
+    }
+    setBusy("goal-clear");
+    setError("");
+    try {
+      const result = await localRequest<{ job: TaskJob }>(
+        `/v1/tasks/${task.id}/goal`,
+        { method: "DELETE" },
+      );
+      setTasks((current) =>
+        current.map((candidate) =>
+          candidate.id === result.job.id ? result.job : candidate,
+        ),
+      );
     } catch (reason) {
       setError(String((reason as Error).message ?? reason));
     } finally {
@@ -3416,14 +3904,17 @@ export default function CouncilIde() {
     }
   }
 
-  async function retryTask(stage?: string) {
+  async function retryTask(stage?: string, updatedPrompt?: string) {
     if (!selectedTask) return;
     setBusy(`retry:${stage ?? "prepare"}`);
     setError("");
     try {
       await localRequest(`/v1/tasks/${selectedTask.id}/retry`, {
         method: "POST",
-        body: JSON.stringify({ stage: stage ?? "prepare" }),
+        body: JSON.stringify({
+          stage: stage ?? "prepare",
+          prompt: updatedPrompt,
+        }),
       });
       await refreshAll();
     } catch (reason) {
@@ -3431,6 +3922,16 @@ export default function CouncilIde() {
     } finally {
       setBusy("");
     }
+  }
+
+  function editAndRestartTask() {
+    if (!selectedTask) return;
+    const updated = window.prompt(
+      "Edit the task before starting a new attempt",
+      selectedTask.prompt,
+    );
+    if (updated == null || !updated.trim()) return;
+    void retryTask("prepare", updated.trim());
   }
 
   async function requestChanges() {
@@ -3665,12 +4166,12 @@ export default function CouncilIde() {
       >
         <aside className="ide-explorer">
         <header className="ide-explorer-header">
-          <img
-            alt=""
-            className="ide-brand"
-            height="31"
-            src="/code-council-logo.png"
-            width="31"
+            <img
+              alt=""
+              className="ide-brand"
+              height="31"
+              src="/code-council-logo.png"
+              width="31"
           />
           <div>
             <strong>code-council</strong>
@@ -3924,10 +4425,132 @@ export default function CouncilIde() {
             >
               {theme === "dark" ? "☀" : "☾"}
             </button>
+            {status?.tools.gh?.available &&
+            /github\.com[/:]/i.test(selectedRepository?.remote ?? "") ? (
+              <button
+                aria-expanded={githubMenuOpen}
+                className="ide-github-button"
+                onClick={() => void toggleGitHubWorkspace()}
+                type="button"
+              >
+                GitHub
+              </button>
+            ) : null}
+            {githubMenuOpen ? (
+              <div className="ide-github-popover">
+                <header>
+                  <div>
+                    <strong>
+                      {githubWorkspace?.repository.nameWithOwner ?? "GitHub workspace"}
+                    </strong>
+                    <small>
+                      Issues, pull requests, reviews and checks without leaving the task flow
+                    </small>
+                  </div>
+                  <button
+                    disabled={githubLoading}
+                    onClick={() => void refreshGitHubWorkspace()}
+                    type="button"
+                  >
+                    {githubLoading ? "Loading…" : "Refresh"}
+                  </button>
+                </header>
+                {githubError ? (
+                  <p className="ide-github-error">{githubError}</p>
+                ) : githubLoading && !githubWorkspace ? (
+                  <p className="ide-github-empty">Loading GitHub work…</p>
+                ) : githubWorkspace ? (
+                  <div className="ide-github-columns">
+                    <section>
+                      <header>
+                        <strong>Open issues</strong>
+                        <span>{githubWorkspace.issues.length}</span>
+                      </header>
+                      <div>
+                        {githubWorkspace.issues.slice(0, 8).map((issue) => (
+                          <article key={issue.number}>
+                            <div>
+                              <a href={issue.url} rel="noreferrer" target="_blank">
+                                #{issue.number} {issue.title}
+                              </a>
+                              <small>
+                                {issue.labels.length
+                                  ? issue.labels.join(" · ")
+                                  : "No labels"}
+                              </small>
+                            </div>
+                            <button
+                              onClick={() =>
+                                draftFromGitHub(
+                                  `Fix GitHub issue #${issue.number}: ${issue.title}\n\n${issue.body}\n\nSource: ${issue.url}`,
+                                  { goal: true },
+                                )
+                              }
+                              type="button"
+                            >
+                              Start goal
+                            </button>
+                          </article>
+                        ))}
+                        {!githubWorkspace.issues.length ? (
+                          <p>No open issues.</p>
+                        ) : null}
+                      </div>
+                    </section>
+                    <section>
+                      <header>
+                        <strong>Open pull requests</strong>
+                        <span>{githubWorkspace.pullRequests.length}</span>
+                      </header>
+                      <div>
+                        {githubWorkspace.pullRequests.slice(0, 8).map((pullRequest) => (
+                          <article key={pullRequest.number}>
+                            <div>
+                              <a
+                                href={pullRequest.url}
+                                rel="noreferrer"
+                                target="_blank"
+                              >
+                                #{pullRequest.number} {pullRequest.title}
+                              </a>
+                              <small>
+                                {pullRequest.isDraft ? "Draft" : "Ready"} ·{" "}
+                                {pullRequest.checks.failing
+                                  ? `${pullRequest.checks.failing} failing`
+                                  : pullRequest.checks.pending
+                                    ? `${pullRequest.checks.pending} pending`
+                                    : `${pullRequest.checks.passing} passing`}
+                              </small>
+                            </div>
+                            <button
+                              onClick={() =>
+                                draftFromGitHub(
+                                  pullRequest.checks.failing
+                                    ? `Fix the failing checks on GitHub pull request #${pullRequest.number}: ${pullRequest.title}\n\nInspect the PR, reproduce the failures locally, implement the smallest correct fix, and verify it.\n\nSource: ${pullRequest.url}`
+                                    : `Review GitHub pull request #${pullRequest.number}: ${pullRequest.title}\n\nInspect the changes, checks, and repository context. Report concrete correctness risks, regressions, and missing tests without modifying files.\n\nSource: ${pullRequest.url}`,
+                                  { goal: pullRequest.checks.failing > 0 },
+                                )
+                              }
+                              type="button"
+                            >
+                              {pullRequest.checks.failing ? "Fix checks" : "Review"}
+                            </button>
+                          </article>
+                        ))}
+                        {!githubWorkspace.pullRequests.length ? (
+                          <p>No open pull requests.</p>
+                        ) : null}
+                      </div>
+                    </section>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
             <button
               className={`ide-context-button ${selectedRepository?.context?.status ?? "missing"}`}
               disabled={!selectedRepository}
               onClick={() => {
+                setGitHubMenuOpen(false);
                 setContextMenuOpen((open) => !open);
               }}
               type="button"
@@ -4324,6 +4947,7 @@ export default function CouncilIde() {
                     busy={busy}
                     now={now}
                     onCancel={() => void taskAction("cancel")}
+                    onEditRestart={editAndRestartTask}
                     onRetry={(stage) => void retryTask(stage)}
                     task={selectedTask}
                   />
@@ -4346,10 +4970,10 @@ export default function CouncilIde() {
             </section>
           ) : (
             <div className="ide-editor-welcome">
-              <img
-                alt="code-council collective intelligence mark"
-                className="ide-welcome-mark"
-                height="64"
+                    <img
+                      alt="code-council collective intelligence mark"
+                      className="ide-welcome-mark"
+                      height="64"
                 src="/code-council-logo.png"
                 width="64"
               />
@@ -4416,6 +5040,31 @@ export default function CouncilIde() {
           </div>
         ) : null}
 
+        {selectedTask && !draftingNew && activeTab?.kind === "task" ? (
+          <>
+            <GoalBar
+              busy={busy}
+              onClear={() => void clearGoal(selectedTask)}
+              onEdit={() => void editGoal(selectedTask)}
+              onPause={() => void pauseOrResumeGoal("pause")}
+              onResume={() => void pauseOrResumeGoal("resume")}
+              task={selectedTask}
+            />
+            {selectedTask.skills?.mode === "explicit" &&
+            selectedTask.skills.selected.length ? (
+              <div className="ide-task-capabilities">
+                <strong>Skills</strong>
+                {selectedTask.skills.selected.map((skill) => (
+                  <span key={`${skill.provider}:${skill.path}`}>
+                    {skill.provider === "claude" ? "Claude" : "Codex"} · $
+                    {skill.name}
+                  </span>
+                ))}
+              </div>
+            ) : null}
+          </>
+        ) : null}
+
         <section className="ide-composer">
           {error ? (
             <div className="ide-error" role="alert">
@@ -4427,8 +5076,14 @@ export default function CouncilIde() {
             aria-label="Message code-council"
             disabled={!selectedRepository}
             onChange={(event) => setPrompt(event.target.value)}
+            onFocus={closeComposerMenus}
+            onPointerDown={closeComposerMenus}
             onKeyDown={(event) => {
-              if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+              if (
+                event.key === "Enter" &&
+                !event.shiftKey &&
+                !event.nativeEvent.isComposing
+              ) {
                 event.preventDefault();
                 void startTask();
               }
@@ -4436,6 +5091,12 @@ export default function CouncilIde() {
             placeholder={
               selectedTask?.status === "awaiting_input" && !draftingNew
                 ? "Answer the clarification so the task can continue"
+                : selectedTask &&
+                    ["queued", "running", "awaiting_approval"].includes(
+                      selectedTask.status,
+                    ) &&
+                    !draftingNew
+                  ? "Send an update to the active agent"
                 : selectedTask?.kind === "chat" && !draftingNew
                   ? "Reply or ask a follow-up question"
                   : "Ask a question or describe a code change"
@@ -4449,8 +5110,36 @@ export default function CouncilIde() {
               <span className="ide-reply-mode">
                 {selectedTask?.status === "awaiting_input"
                   ? "Clarification reply"
-                  : "Continue chat"}
+                  : ["queued", "running", "awaiting_approval"].includes(
+                        selectedTask?.status ?? "",
+                      )
+                    ? "Update active task"
+                    : "Continue chat"}
               </span>
+            ) : null}
+            {selectedTask &&
+            !draftingNew &&
+            ["queued", "running", "awaiting_approval"].includes(
+              selectedTask.status,
+            ) ? (
+              <button
+                className="ide-stop-task"
+                disabled={selectedTask.cancelRequested || busy === "cancel"}
+                onClick={() => void taskAction("cancel")}
+                type="button"
+              >
+                {selectedTask.cancelRequested ? "Stopping…" : "■ Stop"}
+              </button>
+            ) : null}
+            {selectedTask?.goal && !draftingNew && selectedTask.status === "paused" ? (
+              <button
+                className="ide-resume-task"
+                disabled={Boolean(busy)}
+                onClick={() => void pauseOrResumeGoal("resume")}
+                type="button"
+              >
+                Resume goal
+              </button>
             ) : null}
             {selectedTask?.status === "awaiting_input" && !draftingNew ? (
               <button
@@ -4468,7 +5157,11 @@ export default function CouncilIde() {
             <div className="ide-agent-picker">
               <button
                 className="ide-agent-trigger"
-                onClick={() => setAgentMenuOpen((open) => !open)}
+                onClick={() => {
+                  setAgentMenuOpen((open) => !open);
+                  setSkillMenuOpen(false);
+                  setContextMenuOpen(false);
+                }}
                 type="button"
               >
                 <span className={`ide-agent-avatar ${
@@ -4499,6 +5192,133 @@ export default function CouncilIde() {
                 />
               ) : null}
             </div>
+            {!replyingToTask ? (
+              <div className="ide-skill-picker">
+                <button
+                  className={`ide-task-context-toggle ${
+                    skillMode === "explicit" ? "active" : ""
+                  }`}
+                  onClick={() => {
+                    setSkillMenuOpen((open) => !open);
+                    setAgentMenuOpen(false);
+                    setContextMenuOpen(false);
+                  }}
+                  title={
+                    skillMode === "auto"
+                      ? "Each selected agent discovers relevant skills automatically"
+                      : `${selectedSkills.length} explicit skills selected`
+                  }
+                  type="button"
+                >
+                  {skillMode === "auto"
+                    ? "Skills · Auto"
+                    : `Skills · ${selectedSkills.length}`}
+                </button>
+                {skillMenuOpen ? (
+                  <div className="ide-skill-popover">
+                    <header>
+                      <div>
+                        <strong>Agent skills</strong>
+                        <small>Native Codex and Claude workflows available here</small>
+                      </div>
+                      <button
+                        aria-label="Close skills"
+                        onClick={() => setSkillMenuOpen(false)}
+                        type="button"
+                      >
+                        ×
+                      </button>
+                    </header>
+                    <button
+                      className={skillMode === "auto" ? "active" : ""}
+                      onClick={() => {
+                        setSkillMode("auto");
+                        setSelectedSkillPaths([]);
+                      }}
+                      type="button"
+                    >
+                      <span>Auto-select</span>
+                      <small>Let each active agent choose from its native skills.</small>
+                    </button>
+                    <div className="ide-skill-list">
+                      {availableSkills.map((skill) => {
+                        const checked = selectedSkillPaths.includes(skill.path);
+                        return (
+                          <label key={`${skill.provider}:${skill.path}`}>
+                            <input
+                              checked={checked}
+                              onChange={() => {
+                                setSkillMode("explicit");
+                                setSelectedSkillPaths((current) =>
+                                  checked
+                                    ? current.filter((path) => path !== skill.path)
+                                    : [...current, skill.path],
+                                );
+                              }}
+                              type="checkbox"
+                            />
+                            <span>
+                              <strong>
+                                <i className={`ide-skill-provider ${skill.provider}`}>
+                                  {skill.provider === "claude" ? "Claude" : "Codex"}
+                                </i>
+                                ${skill.name}
+                              </strong>
+                              <small>
+                                {skill.description} · {skill.scope}
+                              </small>
+                            </span>
+                          </label>
+                        );
+                      })}
+                      {!skillCatalog ? (
+                        <p>{skillError || "Loading available skills…"}</p>
+                      ) : availableSkills.length === 0 ? (
+                        <p>
+                          {skillCatalog.errors[0]?.message ??
+                            "No enabled skills were found for the selected agents."}
+                        </p>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            {!replyingToTask ? (
+              <>
+                <button
+                  aria-pressed={goalEnabled}
+                  className={`ide-task-context-toggle ${
+                    goalEnabled ? "active ide-goal-toggle" : ""
+                  }`}
+                  onClick={() => {
+                    setGoalEnabled((enabled) => !enabled);
+                    setAgentMenuOpen(false);
+                    setSkillMenuOpen(false);
+                  }}
+                  title="Persist the objective and continue within a bounded token budget"
+                  type="button"
+                >
+                  {goalEnabled ? "Goal · On" : "Goal"}
+                </button>
+                {goalEnabled ? (
+                  <label className="ide-goal-budget">
+                    <span>Budget</span>
+                    <input
+                      aria-label="Goal token budget"
+                      max={1_000_000}
+                      min={1_000}
+                      onChange={(event) =>
+                        setGoalTokenBudget(Number(event.target.value))
+                      }
+                      step={1_000}
+                      type="number"
+                      value={goalTokenBudget}
+                    />
+                  </label>
+                ) : null}
+              </>
+            ) : null}
             {!replyingToTask ? (
               <button
                 aria-pressed={useContextForTask}
@@ -4553,7 +5373,11 @@ export default function CouncilIde() {
                 !agentsReady
               }
               onClick={() => void startTask()}
-              title="Run task (Command Enter)"
+              title={
+                replyingToTask
+                  ? "Send update (Enter)"
+                  : "Run task (Enter, Shift+Enter for newline)"
+              }
               type="button"
             >
               {busy === "start" ? "…" : "↑"}
@@ -5044,7 +5868,7 @@ export default function CouncilIde() {
                       onClick={() => void taskAction("cancel")}
                       type="button"
                     >
-                      {selectedTask.cancelRequested ? "Stopping…" : "Cancel"}
+                      {selectedTask.cancelRequested ? "Stopping…" : "Stop"}
                     </button>
                   ) : null}
                 </header>
@@ -5089,6 +5913,13 @@ export default function CouncilIde() {
                       type="button"
                     >
                       Restart task
+                    </button>
+                    <button
+                      disabled={busy.startsWith("retry:")}
+                      onClick={editAndRestartTask}
+                      type="button"
+                    >
+                      Edit &amp; restart
                     </button>
                   </div>
                 ) : null}

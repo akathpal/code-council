@@ -1,0 +1,292 @@
+{
+  "name": "council",
+  "displayName": "Council — Multi-agent coding workspace",
+  "description": "Coordinate Codex and Claude with isolated worktrees, durable goals, reusable skills, evidence-backed review, and cost-aware routing.",
+  "version": "0.1.0",
+  "publisher": "code-council",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.98.0"
+  },
+  "categories": [
+    "Other",
+    "Extension Packs",
+    "SCM Providers"
+  ],
+  "keywords": [
+    "agents",
+    "codex",
+    "claude",
+    "multi-agent",
+    "worktrees",
+    "github"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onView:council.agentManager",
+    "onCommand:council.openAgentManager",
+    "onCommand:council.openGitHubWorkspace",
+    "onCommand:council.newTask",
+    "onCommand:council.connectWorkspace",
+    "onCommand:council.startRuntime",
+    "onCommand:council.stopRuntime",
+    "onCommand:council.restartRuntime",
+    "onCommand:council.openCodex",
+    "onCommand:council.openClaude",
+    "onCommand:council.sendSelection",
+    "onCommand:council.sendSelectionToCodex",
+    "onCommand:council.sendSelectionToClaude",
+    "onCommand:council.createTaskFromDiagnostic"
+  ],
+  "extensionPack": [
+    "openai.chatgpt",
+    "Anthropic.claude-code"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "council.openAgentManager",
+        "title": "Council: Open Agent Manager",
+        "icon": "$(organization)"
+      },
+      {
+        "command": "council.newTask",
+        "title": "Council: New Task",
+        "icon": "$(add)"
+      },
+      {
+        "command": "council.connectWorkspace",
+        "title": "Council: Connect Current Workspace",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "council.openGitHubWorkspace",
+        "title": "Council: Open GitHub Workspace",
+        "icon": "$(github)"
+      },
+      {
+        "command": "council.refresh",
+        "title": "Council: Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "council.startRuntime",
+        "title": "Council: Start Services",
+        "icon": "$(debug-start)"
+      },
+      {
+        "command": "council.stopRuntime",
+        "title": "Council: Stop Services",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "council.restartRuntime",
+        "title": "Council: Restart Services",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "council.openCodex",
+        "title": "Council: Open Codex",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "council.openClaude",
+        "title": "Council: Open Claude Code",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "council.sendSelection",
+        "title": "Council: Ask About Selection",
+        "icon": "$(organization)"
+      },
+      {
+        "command": "council.sendSelectionToCodex",
+        "title": "Council: Add Selection to Codex"
+      },
+      {
+        "command": "council.sendSelectionToClaude",
+        "title": "Council: Add Selection to Claude"
+      },
+      {
+        "command": "council.createTaskFromDiagnostic",
+        "title": "Council: Create Task from Diagnostic",
+        "icon": "$(lightbulb)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "council",
+          "title": "Council",
+          "icon": "media/council.svg"
+        }
+      ]
+    },
+    "views": {
+      "council": [
+        {
+          "id": "council.agentManager",
+          "name": "Agent Manager",
+          "type": "webview"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "council.newTask",
+          "when": "view == council.agentManager",
+          "group": "navigation@1"
+        },
+        {
+          "command": "council.refresh",
+          "when": "view == council.agentManager",
+          "group": "navigation@2"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "council.sendSelection",
+          "when": "editorHasSelection",
+          "group": "navigation@10"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "council.sendSelection",
+          "when": "editorHasSelection",
+          "group": "council@1"
+        },
+        {
+          "command": "council.sendSelectionToCodex",
+          "when": "editorHasSelection",
+          "group": "council@2"
+        },
+        {
+          "command": "council.sendSelectionToClaude",
+          "when": "editorHasSelection",
+          "group": "council@3"
+        },
+        {
+          "command": "council.createTaskFromDiagnostic",
+          "when": "resourceScheme == file",
+          "group": "council@4"
+        }
+      ],
+      "scm/title": [
+        {
+          "command": "council.openGitHubWorkspace",
+          "group": "navigation@10"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "council.openAgentManager",
+        "key": "ctrl+alt+c",
+        "mac": "cmd+alt+c"
+      },
+      {
+        "command": "council.newTask",
+        "key": "ctrl+alt+n",
+        "mac": "cmd+alt+n"
+      }
+    ],
+    "configuration": {
+      "title": "Council",
+      "properties": {
+        "council.runtimePath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the code-council checkout or packaged runtime. Leave empty to discover it from the current workspace or bundled installation."
+        },
+        "council.nodeExecutable": {
+          "type": "string",
+          "default": "node",
+          "description": "Node.js 22.13+ executable used to start the Council runtime."
+        },
+        "council.localApiUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:4781",
+          "description": "Loopback URL of the Council local companion."
+        },
+        "council.uiUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:3000",
+          "description": "Loopback URL of the full Council Agent Manager."
+        },
+        "council.pollIntervalMs": {
+          "type": "number",
+          "default": 3000,
+          "minimum": 1000,
+          "maximum": 30000,
+          "description": "How often the workbench checks Council task state."
+        },
+        "council.startOnOpen": {
+          "type": "boolean",
+          "default": false,
+          "description": "Start the local Council services when an editor workspace opens."
+        }
+      }
+    },
+    "walkthroughs": [
+      {
+        "id": "council.getStarted",
+        "title": "Get started with Council",
+        "description": "Connect a repository and coordinate Codex and Claude without leaving your editor.",
+        "steps": [
+          {
+            "id": "council.start",
+            "title": "Start the local runtime",
+            "description": "Run the Council services. Repository paths and provider logins remain on this machine.",
+            "media": {
+              "markdown": "media/start.md"
+            },
+            "completionEvents": [
+              "onCommand:council.startRuntime"
+            ]
+          },
+          {
+            "id": "council.connect",
+            "title": "Connect the current workspace",
+            "description": "Register the open Git repository with Council.",
+            "media": {
+              "markdown": "media/connect.md"
+            },
+            "completionEvents": [
+              "onCommand:council.connectWorkspace"
+            ]
+          },
+          {
+            "id": "council.task",
+            "title": "Start a review-gated task",
+            "description": "Create a Codex, Claude, or multi-agent Council task.",
+            "media": {
+              "markdown": "media/task.md"
+            },
+            "completionEvents": [
+              "onCommand:council.newTask"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "tsc -p tsconfig.json",
+    "compile": "tsc -p tsconfig.json",
+    "watch": "tsc -w -p tsconfig.json"
+  },
+  "files": [
+    "dist/**",
+    "media/**",
+    "package.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/akathpal/code-council.git"
+  },
+  "homepage": "https://github.com/akathpal/code-council"
+}

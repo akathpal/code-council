@@ -1,0 +1,33 @@
+{
+  "nameShort": "Council",
+  "nameLong": "Council IDE",
+  "applicationName": "council",
+  "dataFolderName": ".council-ide",
+  "urlProtocol": "council",
+  "win32AppUserModelId": "CodeCouncil.CouncilIDE",
+  "win32MutexName": "councilide",
+  "win32RegValueName": "Council",
+  "darwinBundleIdentifier": "dev.codecouncil.ide",
+  "linuxIconName": "council",
+  "licenseName": "MIT",
+  "licenseUrl": "https://github.com/akathpal/code-council/blob/main/LICENSE",
+  "reportIssueUrl": "https://github.com/akathpal/code-council/issues/new/choose",
+  "requestFeatureUrl": "https://github.com/akathpal/code-council/issues/new?template=feature_request.yml",
+  "documentationUrl": "https://github.com/akathpal/code-council#readme",
+  "extensionsGallery": {
+    "serviceUrl": "https://open-vsx.org/vscode/gallery",
+    "itemUrl": "https://open-vsx.org/vscode/item",
+    "latestUrlTemplate": "https://open-vsx.org/vscode/gallery/{publisher}/{name}/latest",
+    "controlUrl": "https://raw.githubusercontent.com/EclipseFdn/publish-extensions/refs/heads/master/extension-control/extensions.json"
+  },
+  "linkProtectionTrustedDomains": [
+    "https://open-vsx.org",
+    "https://github.com",
+    "https://openai.com",
+    "https://code.claude.com"
+  ],
+  "extensionRecommendations": [
+    "openai.chatgpt",
+    "Anthropic.claude-code"
+  ]
+}

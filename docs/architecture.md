@@ -2,8 +2,9 @@
 
 ## Product boundary
 
-code-council is a local workflow layer over OpenHands Agent Canvas and Agent Server.
-It does not replace Codex or Claude Code. It supplies:
+code-council is a local workflow layer over OpenHands Agent Canvas and Agent
+Server, available through its web console and a thin Code-OSS workbench
+distribution. It does not replace Codex or Claude Code. It supplies:
 
 - guided installation and native authentication for Codex CLI and Claude Code;
 - local-folder and Git repository connections;
@@ -41,7 +42,10 @@ foundation; ACP-compatible agents remain extensible execution backends.
    reports the result in the task: chat is repository-aware and read-only,
    while code changes are isolated and review-gated. The user chooses Codex
    only, Claude only, or code-council; automatic model escalation remains opt-in
-   rather than silently spending council tokens.
+   rather than silently spending council tokens. Each task owns one or more
+   attempts. Provider-native Codex thread IDs and Claude session IDs are stored
+   on the task so follow-ups resume context without replaying the complete
+   conversation.
 7. If a coding request is underspecified, code-council pauses the task in
    `awaiting_input` before editing. Codex and Claude can also return a
    structured clarification request from any later stage. The answer is stored
@@ -62,6 +66,11 @@ foundation; ACP-compatible agents remain extensible execution backends.
    files; the user can refresh execution on the latest repository snapshot and
    review the new patch. Decline removes the worktree, while request changes
    keeps it and asks Codex for a revision.
+11. A longer coding request can opt into Goal mode. The local runner sets a
+    native Codex thread goal with a user-visible token budget, continues only
+    while the goal remains active and within its safety limit, and preserves
+    the thread and worktree when paused. Sandbox and approval policy remain
+    unchanged.
 
 ## Local runtime shape
 
@@ -69,7 +78,10 @@ code-council is installed from source and runs entirely on the developer's machi
 
 ```mermaid
 flowchart LR
-  UI["code-council UI :3000"] --> DAEMON["Loopback service :4781"]
+  IDE["Council IDE / workbench extension"] --> UI["Agent Manager :3000"]
+  IDE --> NATIVE["Separate Codex + Claude extensions"]
+  UI --> DAEMON["Loopback service :4781"]
+  IDE --> DAEMON
   DAEMON --> OH["OpenHands Agent Server :8001"]
   OH --> ACP["ACP agents"]
   DAEMON --> GIT["Git repositories + worktrees"]
@@ -80,6 +92,28 @@ flowchart LR
   DAEMON --> EVENTS["Persisted jobs + evaluations"]
   EVENTS --> POLICY["Adaptive strategy"]
 ```
+
+### Council IDE workbench
+
+Council IDE is a shallow Code-OSS distribution rather than a second agent
+runtime. Product branding and the Open VSX gallery are applied through
+`ide/product.overrides.json`; the compiled `code-council.council` extension is
+bundled as a first-party workbench contribution. Nearly all behavior remains
+outside `src/vs`, keeping upstream Code-OSS updates tractable.
+
+The activity-bar view shows runtime health, task attention, recent runs, and
+separate Codex and Claude launchers. Editor commands hand selections and
+diagnostics to a prefilled Council composer. The full Agent Manager remains the
+authoritative task interface while native editor surfaces continue to own file
+editing, terminals, source control, debugging, and language tooling.
+
+Council IDE uses Open VSX rather than the Microsoft Visual Studio Marketplace.
+Codex and Claude Code are referenced by their publisher-controlled registry
+identifiers and remain independently installed extensions. Council neither
+vendors their VSIX files nor merges their private session state into Council
+tasks. Council-managed automation continues to use native CLI protocols so
+interruption, steering, goals, skills, cost, and evidence have one durable
+control plane.
 
 ### code-council UI
 
@@ -97,8 +131,10 @@ switches between Conversation, Environment, Monitor, and Memory. Environment
 shows clickable change counts, local/GitHub source, worktree, branch, patch
 state, processes, context sources, and an editor handoff for committing or
 pushing accepted work. The composer stays docked underneath and exposes
-Codex-only, Claude-only, or code-council routing, model, and reasoning controls;
-chat versus code intent is inferred and then made visible in task status.
+Codex-only, Claude-only, or code-council routing, model, reasoning, repository
+skills, and bounded Goal mode controls; chat versus code intent is inferred and
+then made visible in task status. Enter sends, Shift+Enter inserts a newline,
+and an active task keeps Stop plus update controls beside the composer.
 
 The explorer footer shows locally read session/weekly usage for Codex and
 Claude. Repository disconnect is available beside the repository selector and
@@ -108,8 +144,11 @@ model and effort, PID, elapsed time, clarification state, and verification
 evidence. Agent prose and a compact list of recent actions appear in the main
 conversation; Monitor contains detailed normalized commands, file operations,
 searches, PIDs, bounded output, workflow history, and controls. It intentionally
-does not duplicate assistant responses or expose hidden chain-of-thought. Failed tasks can
-resume from their last durable council artifact or restart. Conflicted patches
+does not duplicate assistant responses or expose hidden chain-of-thought.
+Failed tasks can resume from their last durable council artifact, edit and
+restart as a linked attempt, or restart unchanged. Native Codex turns accept
+live steering; providers without same-turn steering use a stop-and-restart
+fallback that preserves the user's update. Conflicted patches
 can be refreshed on the latest repository snapshot. When a patch is ready, the
 conversation links to its
 diff tab with editor handoff and accept/decline/request-changes controls.
@@ -119,7 +158,11 @@ catalog from each installed CLI rather than hard-coding a short picker. It
 supports reversible task archives and confirmed permanent deletion; deletion
 first cleans any retained isolated worktree and is disallowed while a task is
 actively running.
-talks to the local service through a same-origin proxy and rehydrates the
+An authenticated GitHub CLI adds an on-demand workspace for issues, pull
+requests, review state, and check summaries. Those records become draft tasks
+or goals only after the user chooses an action; remote mutations remain
+separate confirmed commit, push, and draft-PR operations. The UI talks to the
+local service through a same-origin proxy and rehydrates the
 repository registry, conversations, tasks, context jobs, processes, and pending
 approvals after reload.
 
@@ -140,6 +183,15 @@ The local runner is the trust boundary for native tools. It:
 - routes Codex command and file-change approval requests bidirectionally through
   `codex app-server`; an HTTP decision endpoint resolves the original suspended
   JSON-RPC request without rerunning the turn;
+- persists and resumes non-ephemeral Codex threads and Claude sessions;
+- discovers Codex skills using `skills/list` and Claude Agent Skills from
+  project, user, legacy-command, and enabled-plugin locations; records
+  provider-tagged explicit selections; submits Codex selections as typed skill
+  inputs and preloads Claude selections through a task-scoped native agent;
+- maps Stop, live task updates, goal pause/resume, and goal edits to native
+  Codex interruption, steering, and thread-goal operations plus Claude
+  streaming input, interruptible `/goal` loops, and resumable sessions, with
+  bounded provider fallbacks;
 - cancels active task and context processes with TERM followed by a bounded
   KILL fallback, then cleans isolated worktrees;
 - builds repo memory;
@@ -151,9 +203,11 @@ The local runner is the trust boundary for native tools. It:
 - never sends repository content to a provider unless the chosen adapter is authorized.
 
 Every CLI is wrapped by a small adapter. Codex uses its app-server interface
-for streamed events, approvals, and optional structured context generation;
-Claude uses `stream-json` for task calls and structured JSON for context
-generation:
+for persisted threads, streamed events, approvals, skills, goals, steering,
+interruption, and optional structured context generation. Claude uses
+persisted CLI sessions, bidirectional `stream-json` for live task guidance,
+task-scoped agents for explicit skill preloading, native `/goal` loops, and
+structured JSON for context generation:
 
 ```ts
 interface AgentAdapter {
@@ -372,14 +426,17 @@ review outcomes.
 
 ## Persistence
 
-The current local release persists repository connections, settings, tasks,
-context jobs, conversation messages, process metadata, usage, approvals, and
+The schema-version 3 local state persists repository connections, settings,
+tasks, linked attempts, provider thread/session IDs, skill selections, goals,
+conversation messages, process metadata, usage, approvals, context jobs, and
 review state in `~/.council/state.json`. Context documents live in the connected
 repository and isolated worktrees live under `~/.council/worktrees/`.
 
 Browser refresh is recoverable because native processes belong to the loopback
-service. A loopback-service restart cannot reattach native child processes yet;
-those jobs are marked interrupted with an explicit event.
+service. A loopback-service restart cannot reattach an operating-system child
+process, so ordinary active jobs are marked interrupted. Goal-mode jobs are
+paused instead: their persisted Codex thread and isolated worktree remain
+resumable from the UI.
 
 ## Security
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createServer } from "node:http";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   acceptTaskJob,
   answerTaskClarification,
@@ -29,19 +29,29 @@ import {
   openRepositoryInEditor,
   readAgentUsage,
   readAgentModelCatalog,
+  readClaudeSkills,
+  readGitHubWorkspace,
   readRepositoryFile,
   rejectTaskJob,
   retryChatJob,
   retryTaskJob,
+  resumeTaskJob,
   reviseTaskJob,
   routeTask,
+  pauseTaskJob,
   pushTaskCommit,
   taskCommitMessage,
+  updateActiveTaskJob,
   updateGraphifyIndex,
   validateAgentConfig,
   validateContextConfig,
   validateTaskContextPolicy,
 } from "./core.mjs";
+import {
+  clearCodexGoal,
+  readCodexSkills,
+  setCodexGoal,
+} from "./codex-app-server.mjs";
 import {
   agentActivityFromLine,
   mergeAgentActivity,
@@ -79,6 +89,7 @@ const repositories = new Map(
 );
 let settings = stored.settings ?? DEFAULT_SETTINGS;
 const activeProcesses = new Map();
+const activeAgentControls = new Map();
 const approvalWaiters = new Map();
 let persistQueue = Promise.resolve();
 let outputPersistTimer = null;
@@ -90,6 +101,132 @@ let modelCatalogCacheAt = 0;
 let modelCatalogRequest = null;
 let editorCache = null;
 let editorCacheAt = 0;
+const skillsCache = new Map();
+
+async function codexSkills(repositoryPath, forceReload = false) {
+  const cacheKey = `codex:${repositoryPath}`;
+  const cached = skillsCache.get(cacheKey);
+  if (!forceReload && cached && Date.now() - cached.at < 30_000) {
+    return cached.value;
+  }
+  let result;
+  try {
+    result = await readCodexSkills({
+      cwd: repositoryPath,
+      forceReload,
+    });
+  } catch (error) {
+    const value = {
+      provider: "codex",
+      cwd: repositoryPath,
+      skills: [],
+      errors: [
+        {
+          path: repositoryPath,
+          message: `Codex skill discovery is unavailable: ${String(error.message ?? error)}`,
+        },
+      ],
+    };
+    skillsCache.set(cacheKey, { at: Date.now(), value });
+    return value;
+  }
+  const entry =
+    result?.data?.find((candidate) => candidate.cwd === repositoryPath) ??
+    result?.data?.[0] ??
+    { cwd: repositoryPath, skills: [], errors: [] };
+  const value = {
+    provider: "codex",
+    cwd: repositoryPath,
+    skills: (entry.skills ?? []).map((skill) => ({
+      provider: "codex",
+      name: skill.name,
+      invocation: skill.name,
+      path: skill.path,
+      scope: skill.scope,
+      description:
+        skill.interface?.shortDescription ??
+        skill.shortDescription ??
+        skill.description,
+      enabled: skill.enabled !== false,
+      dependencies: skill.dependencies ?? null,
+    })),
+    errors: entry.errors ?? [],
+  };
+  skillsCache.set(cacheKey, { at: Date.now(), value });
+  return value;
+}
+
+async function claudeSkills(repositoryPath, forceReload = false) {
+  const cacheKey = `claude:${repositoryPath}`;
+  const cached = skillsCache.get(cacheKey);
+  if (!forceReload && cached && Date.now() - cached.at < 30_000) {
+    return cached.value;
+  }
+  let value;
+  try {
+    value = await readClaudeSkills(repositoryPath);
+  } catch (error) {
+    value = {
+      provider: "claude",
+      cwd: repositoryPath,
+      skills: [],
+      errors: [
+        {
+          path: repositoryPath,
+          message: `Claude skill discovery is unavailable: ${String(error.message ?? error)}`,
+        },
+      ],
+    };
+  }
+  skillsCache.set(cacheKey, { at: Date.now(), value });
+  return value;
+}
+
+async function agentSkills(repositoryPath, forceReload = false) {
+  const [codex, claude] = await Promise.all([
+    codexSkills(repositoryPath, forceReload),
+    claudeSkills(repositoryPath, forceReload),
+  ]);
+  return {
+    provider: "all",
+    cwd: repositoryPath,
+    skills: [...codex.skills, ...claude.skills].sort(
+      (left, right) =>
+        left.provider.localeCompare(right.provider) ||
+        left.name.localeCompare(right.name),
+    ),
+    errors: [...codex.errors, ...claude.errors],
+    providers: { codex, claude },
+  };
+}
+
+async function validatedSkillSelection(repositoryPath, value) {
+  const mode = value?.mode === "explicit" ? "explicit" : "auto";
+  if (mode === "auto") return { mode, selected: [] };
+  const requested = Array.isArray(value?.selected) ? value.selected : [];
+  if (requested.length > 20) {
+    throw new Error("Choose no more than 20 skills for one task.");
+  }
+  const catalog = await agentSkills(repositoryPath);
+  const available = new Map(
+    catalog.skills
+      .filter((skill) => skill.enabled)
+      .map((skill) => [`${skill.provider}:${skill.path}`, skill]),
+  );
+  const selected = requested.map((skill) => {
+    const provider = skill?.provider === "claude" ? "claude" : "codex";
+    const match = available.get(
+      `${provider}:${String(skill?.path ?? "")}`,
+    );
+    if (!match || match.name !== String(skill?.name ?? "")) {
+      throw new Error(
+        `The selected ${provider === "claude" ? "Claude" : "Codex"} skill ${String(skill?.name ?? skill?.path ?? "")} is no longer available. Refresh skills and try again.`,
+      );
+    }
+    return match;
+  });
+  return { mode, selected };
+}
 
 async function cachedAgentUsage(tools) {
   const maxAge = 60_000;
@@ -159,10 +296,38 @@ function interrupted(job, message) {
 }
 
 for (const job of taskJobs.values()) {
-  interrupted(
-    job,
-    "The local service restarted while this task was running. Start a new task; its original repository was not changed.",
-  );
+  if (
+    job.goal?.enabled &&
+    ["queued", "running", "awaiting_approval"].includes(job.status)
+  ) {
+    const now = new Date().toISOString();
+    job.pausedStage = job.stage;
+    job.status = "paused";
+    job.stage = "paused";
+    job.pauseRequested = false;
+    job.cancelRequested = false;
+    job.goal.status = "paused";
+    job.goal.updatedAt = now;
+    job.updatedAt = now;
+    const attempt = job.attempts?.at(-1);
+    if (attempt) {
+      attempt.status = "paused";
+      attempt.stage = "paused";
+      attempt.updatedAt = now;
+      attempt.endedAt = null;
+    }
+    job.events.push({
+      stage: "paused",
+      message:
+        "The local service restarted. The durable goal, agent thread, and isolated worktree were preserved; choose Resume to continue.",
+      at: now,
+    });
+  } else {
+    interrupted(
+      job,
+      "The local service restarted while this task was running. Restart the task; its original repository was not changed.",
+    );
+  }
 }
 for (const job of contextJobs.values()) {
   interrupted(
@@ -204,6 +369,12 @@ function appendTail(value, text, maxChars = 80_000) {
 function processRuntime(job, agent, stage) {
   let processRecord = null;
   let activityBuffer = "";
+  const goalUsageBaseline =
+    agent === "claude" &&
+    stage === "execute" &&
+    job.goal?.provider === "claude"
+      ? Number(job.goal.tokensUsed ?? 0)
+      : null;
   return {
     onSpawn({ child, pid, executable, args }) {
       const now = new Date().toISOString();
@@ -253,6 +424,15 @@ function processRuntime(job, agent, stage) {
       }
       scheduleOutputPersist();
     },
+    onUsage({ tokens }) {
+      if (goalUsageBaseline == null || !job.goal) return;
+      job.goal.tokensUsed = Math.max(
+        Number(job.goal.tokensUsed ?? 0),
+        goalUsageBaseline + Math.max(0, Number(tokens ?? 0)),
+      );
+      job.goal.updatedAt = new Date().toISOString();
+      scheduleOutputPersist();
+    },
     onExit({ code, signal }) {
       if (!processRecord) return;
       if (activityBuffer.trim() && ["codex", "claude"].includes(agent)) {
@@ -282,7 +462,85 @@ function processRuntime(job, agent, stage) {
       if (activeProcesses.get(job.id)?.size === 0) {
         activeProcesses.delete(job.id);
       }
+      const control = activeAgentControls.get(job.id);
+      if (control?.pid === processRecord.pid) {
+        activeAgentControls.delete(job.id);
+      }
+      if (
+        job.agentSessions?.[agent]?.threadId ||
+        job.agentSessions?.[agent]?.sessionId
+      ) {
+        job.agentSessions[agent] = {
+          ...job.agentSessions[agent],
+          status: "idle",
+          updatedAt: processRecord.endedAt,
+        };
+      }
       void persist();
+    },
+    async onThread({ threadId, resumed }) {
+      const now = new Date().toISOString();
+      job.agentSessions ??= {};
+      job.agentSessions[agent] = {
+        ...(job.agentSessions[agent] ?? {}),
+        threadId,
+        turnId: null,
+        stage,
+        status: "running",
+        resumed,
+        updatedAt: now,
+      };
+      job.updatedAt = now;
+      await persist();
+    },
+    async onGoal(goal) {
+      if (!goal && !job.goal) return;
+      const now = new Date().toISOString();
+      job.goal = goal
+        ? {
+            ...(job.goal ?? {}),
+            ...goal,
+            enabled: true,
+            provider: "codex",
+            native: true,
+            updatedAt: now,
+          }
+        : null;
+      job.updatedAt = now;
+      await persist();
+    },
+    async onControl(controller) {
+      if (!processRecord) return;
+      if (!controller) {
+        const active = activeAgentControls.get(job.id);
+        if (active?.pid === processRecord.pid) {
+          activeAgentControls.delete(job.id);
+        }
+        return;
+      }
+      job.agentSessions ??= {};
+      job.agentSessions[agent] = {
+        ...(job.agentSessions[agent] ?? {}),
+        ...(controller.threadId
+          ? {
+              threadId: controller.threadId,
+              turnId: controller.turnId ?? null,
+            }
+          : {}),
+        ...(controller.sessionId
+          ? { sessionId: controller.sessionId }
+          : {}),
+        stage,
+        status: "running",
+        updatedAt: new Date().toISOString(),
+      };
+      activeAgentControls.set(job.id, {
+        pid: processRecord.pid,
+        agent,
+        stage,
+        controller,
+      });
+      await persist();
     },
     async onApproval(approval) {
       const key = `${job.id}:${approval.id}`;
@@ -314,15 +572,51 @@ function processRuntime(job, agent, stage) {
   };
 }
 
-function stopProcesses(jobId) {
+function stopProcesses(jobId, signal = "SIGTERM") {
   const children = activeProcesses.get(jobId);
   if (!children) return;
-  for (const child of children.values()) child.kill("SIGTERM");
+  for (const child of children.values()) child.kill(signal);
   setTimeout(() => {
     for (const child of children.values()) {
       if (child.exitCode == null) child.kill("SIGKILL");
     }
   }, 2_000).unref();
+}
+
+function stopProcess(jobId, pid) {
+  const child = activeProcesses.get(jobId)?.get(pid);
+  if (!child || child.exitCode != null) return;
+  child.kill("SIGTERM");
+  setTimeout(() => {
+    if (child.exitCode == null) child.kill("SIGKILL");
+  }, 2_000).unref();
+}
+
+async function interruptTask(job, options = {}) {
+  const active = activeAgentControls.get(job.id);
+  if (active?.controller) {
+    try {
+      if (options.pauseGoal && active.controller.setGoal && job.goal) {
+        await active.controller.setGoal({
+          objective: job.goal.objective,
+          status: "paused",
+          tokenBudget: job.goal.tokenBudget,
+        });
+      }
+      await active.controller.interrupt();
+      setTimeout(() => stopProcess(job.id, active.pid), 1_500).unref();
+      return true;
+    } catch {
+      // Fall through to terminating the provider process.
+    }
+  }
+  stopProcesses(
+    job.id,
+    options.pauseGoal && job.goal?.provider === "claude"
+      ? "SIGINT"
+      : "SIGTERM",
+  );
+  return false;
 }
 
 function repositoryId(repositoryPath) {
@@ -618,6 +912,10 @@ const server = createServer(async (request, response) => {
             liveProcesses: true,
             interactiveApprovals: true,
             cancellation: true,
+            liveSteering: true,
+            resumableAgentThreads: true,
+            skills: true,
+            durableGoals: true,
             manualRoutingDefault: true,
             acceptedPatchContextRefresh: true,
             contextProvider: settings.context.provider,
@@ -828,6 +1126,33 @@ const server = createServer(async (request, response) => {
       );
     }
 
+    const repositorySkillsMatch = url.pathname.match(
+      /^\/v1\/repositories\/([^/]+)\/skills$/,
+    );
+    if (request.method === "GET" && repositorySkillsMatch) {
+      const repository = repositories.get(repositorySkillsMatch[1]);
+      if (!repository) {
+        return send(response, 404, { error: "Repository not found." }, origin);
+      }
+      const result = await agentSkills(
+        repository.path,
+        url.searchParams.get("refresh") === "1",
+      );
+      return send(response, 200, result, origin);
+    }
+
+    const repositoryGitHubMatch = url.pathname.match(
+      /^\/v1\/repositories\/([^/]+)\/github$/,
+    );
+    if (request.method === "GET" && repositoryGitHubMatch) {
+      const repository = repositories.get(repositoryGitHubMatch[1]);
+      if (!repository) {
+        return send(response, 404, { error: "Repository not found." }, origin);
+      }
+      const result = await readGitHubWorkspace(repository.path);
+      return send(response, 200, result, origin);
+    }
+
     if (
       request.method === "GET" &&
       url.pathname === "/v1/context/jobs"
@@ -1013,9 +1338,12 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && url.pathname === "/v1/tasks/start") {
       const payload = await body(request);
       const repository = await inspectRepository(payload.path);
-      const intent = inferPromptIntent(payload.prompt, payload.intent);
+      const goalRequested = payload.goal?.enabled === true;
+      const intent = goalRequested
+        ? "code"
+        : inferPromptIntent(payload.prompt, payload.intent);
       const routingMode = payload.routingMode === "auto" ? "auto" : "manual";
-      const decision =
+      let decision =
         routingMode === "auto"
           ? routeTask(payload.prompt, {
               estimatedFiles: payload.estimatedFiles,
@@ -1025,6 +1353,36 @@ const server = createServer(async (request, response) => {
           : manualTaskDecision(payload.strategy ?? "codex_only", {
               memoryFresh: repository.context.status === "fresh",
             });
+      const skills = await validatedSkillSelection(
+        repository.path,
+        payload.skills,
+      );
+      const selectedProviders = new Set(
+        skills.selected.map((skill) => skill.provider),
+      );
+      if (routingMode === "auto" && selectedProviders.has("claude")) {
+        decision = manualTaskDecision(
+          selectedProviders.has("codex")
+            ? "council_plan_codex_execute"
+            : "claude_only",
+          { memoryFresh: repository.context.status === "fresh" },
+        );
+      } else if (routingMode === "manual" && skills.mode === "explicit") {
+        const supportedProviders =
+          decision.strategy === "council_plan_codex_execute"
+            ? new Set(["codex", "claude"])
+            : decision.strategy === "claude_only"
+              ? new Set(["claude"])
+              : new Set(["codex"]);
+        const unsupported = skills.selected.find(
+          (skill) => !supportedProviders.has(skill.provider),
+        );
+        if (unsupported) {
+          throw new Error(
+            `The selected ${unsupported.provider === "claude" ? "Claude" : "Codex"} skill requires a routing option that uses that provider.`,
+          );
+        }
+      }
       const contextPolicy = validateTaskContextPolicy(
         payload.contextPolicy ?? {},
         settings.context,
@@ -1039,6 +1397,7 @@ const server = createServer(async (request, response) => {
             decision,
             intent,
             contextPolicy,
+            skills,
             safety:
               "No agent was called and no repository files were changed.",
           },
@@ -1056,6 +1415,7 @@ const server = createServer(async (request, response) => {
               payload.strategy ?? settings.strategy,
               agentConfig,
               contextPolicy,
+              { skills },
             )
           : createTaskJob(
               repository,
@@ -1063,6 +1423,18 @@ const server = createServer(async (request, response) => {
               decision,
               agentConfig,
               contextPolicy,
+              {
+                skills,
+                goal: goalRequested
+                  ? {
+                      enabled: true,
+                      objective: payload.goal.objective ?? payload.prompt,
+                      tokenBudget: payload.goal.tokenBudget,
+                      autoContinue: payload.goal.autoContinue,
+                      maxContinuations: payload.goal.maxContinuations,
+                    }
+                  : null,
+              },
             );
       taskJobs.set(job.id, job);
       await persist();
@@ -1100,10 +1472,57 @@ const server = createServer(async (request, response) => {
         worktreeRoot: process.env.COUNCIL_WORKTREE_ROOT,
         agentRuntime: processRuntime,
       };
-      if (job.kind === "chat") {
-        if (["queued", "running", "awaiting_approval"].includes(job.status)) {
-          throw new Error("Wait for the current reply before sending another message.");
+      if (["queued", "running", "awaiting_approval"].includes(job.status)) {
+        const active = activeAgentControls.get(job.id);
+        if (active?.controller?.steer) {
+          let delivered = false;
+          try {
+            await active.controller.steer(
+              message,
+              job.skills?.mode === "explicit"
+                ? job.skills.selected.filter(
+                    (skill) => skill.provider === active.agent,
+                  )
+                : [],
+            );
+            delivered = true;
+            await updateActiveTaskJob(job, message, { onUpdate: persist });
+          } catch {
+            if (delivered) {
+              const now = new Date().toISOString();
+              job.conversation ??= [];
+              if (job.conversation.at(-1)?.content !== message) {
+                job.conversation.push({
+                  id: randomUUID(),
+                  role: "user",
+                  content: message,
+                  kind: "steering",
+                  at: now,
+                });
+              }
+              job.events.push({
+                stage: "steered",
+                message: "The update reached the agent as its turn completed.",
+                at: now,
+              });
+              job.updatedAt = now;
+              await persist();
+            } else {
+              await updateActiveTaskJob(job, message, {
+                restart: true,
+                onUpdate: persist,
+              });
+              await interruptTask(job);
+            }
+          }
+        } else {
+          await updateActiveTaskJob(job, message, {
+            restart: true,
+            onUpdate: persist,
+          });
+          await interruptTask(job);
         }
+      } else if (job.kind === "chat") {
         void executeChatJob(job, message, runtimeOptions);
       } else if (job.status === "awaiting_input") {
         await answerTaskClarification(job, message, { onUpdate: persist });
@@ -1140,7 +1559,7 @@ const server = createServer(async (request, response) => {
         return send(response, 404, { error: "Task run not found." }, origin);
       }
       await cancelTaskJob(job, { onUpdate: persist });
-      stopProcesses(job.id);
+      await interruptTask(job);
       const waiting = job.approval
         ? approvalWaiters.get(`${job.id}:${job.approval.id}`)
         : null;
@@ -1166,9 +1585,160 @@ const server = createServer(async (request, response) => {
         worktreeRoot: process.env.COUNCIL_WORKTREE_ROOT,
         agentRuntime: processRuntime,
       };
-      if (job.kind === "chat") void retryChatJob(job, runtimeOptions);
-      else void retryTaskJob(job, payload.stage, runtimeOptions);
+      const retryOptions = {
+        ...runtimeOptions,
+        updatedPrompt: payload.prompt,
+      };
+      if (job.kind === "chat") void retryChatJob(job, retryOptions);
+      else void retryTaskJob(job, payload.stage, retryOptions);
       return send(response, 202, { job: taskForResponse(job) }, origin);
+    }
+
+    const pauseMatch = url.pathname.match(/^\/v1\/tasks\/([^/]+)\/pause$/);
+    if (request.method === "POST" && pauseMatch) {
+      const job = taskJobs.get(pauseMatch[1]);
+      if (!job) {
+        return send(response, 404, { error: "Task run not found." }, origin);
+      }
+      await pauseTaskJob(job, { onUpdate: persist });
+      await interruptTask(job, { pauseGoal: true });
+      return send(response, 202, { job: taskForResponse(job) }, origin);
+    }
+
+    const resumeMatch = url.pathname.match(/^\/v1\/tasks\/([^/]+)\/resume$/);
+    if (request.method === "POST" && resumeMatch) {
+      const job = taskJobs.get(resumeMatch[1]);
+      if (!job) {
+        return send(response, 404, { error: "Task run not found." }, origin);
+      }
+      const threadId = job.agentSessions?.codex?.threadId;
+      if (threadId && job.goal?.provider === "codex") {
+        const result = await setCodexGoal(threadId, {
+          objective: job.goal.objective,
+          status: "active",
+          tokenBudget: job.goal.tokenBudget,
+        }, { cwd: job.workspace?.path ?? job.repository });
+        if (result?.goal) {
+          job.goal = {
+            ...job.goal,
+            ...result.goal,
+            enabled: true,
+            provider: "codex",
+            native: true,
+          };
+        }
+      }
+      const runtimeOptions = {
+        onUpdate: persist,
+        worktreeRoot: process.env.COUNCIL_WORKTREE_ROOT,
+        agentRuntime: processRuntime,
+      };
+      void resumeTaskJob(job, runtimeOptions);
+      return send(response, 202, { job: taskForResponse(job) }, origin);
+    }
+
+    const goalMatch = url.pathname.match(/^\/v1\/tasks\/([^/]+)\/goal$/);
+    if (request.method === "POST" && goalMatch) {
+      const job = taskJobs.get(goalMatch[1]);
+      if (!job) {
+        return send(response, 404, { error: "Task run not found." }, origin);
+      }
+      if (!job.goal?.enabled) {
+        throw new Error("This task was not started in Goal mode.");
+      }
+      const payload = await body(request);
+      const objective = String(
+        payload.objective ?? job.goal.objective,
+      ).trim();
+      if (!objective) throw new Error("Enter a goal objective.");
+      const tokenBudget = Math.max(
+        1_000,
+        Math.min(
+          1_000_000,
+          Math.round(Number(payload.tokenBudget ?? job.goal.tokenBudget)) ||
+            job.goal.tokenBudget,
+        ),
+      );
+      const nextGoal = {
+        ...job.goal,
+        objective: objective.slice(0, 20_000),
+        tokenBudget,
+        updatedAt: new Date().toISOString(),
+      };
+      const active = activeAgentControls.get(job.id);
+      let nativeGoal = null;
+      if (job.goal.provider === "codex" && active?.controller?.setGoal) {
+        nativeGoal = await active.controller.setGoal(nextGoal);
+      } else if (
+        job.goal.provider === "codex" &&
+        job.agentSessions?.codex?.threadId
+      ) {
+        nativeGoal = (
+          await setCodexGoal(
+            job.agentSessions.codex.threadId,
+            nextGoal,
+            { cwd: job.workspace?.path ?? job.repository },
+          )
+        )?.goal;
+      }
+      if (
+        job.goal.provider === "claude" &&
+        nextGoal.objective !== job.goal.objective
+      ) {
+        delete job.agentSessions?.claude;
+      }
+      job.goal = {
+        ...nextGoal,
+        ...(nativeGoal ?? {}),
+        enabled: true,
+        provider: job.goal.provider,
+        native:
+          job.goal.provider === "claude"
+            ? true
+            : Boolean(nativeGoal) || job.goal.native,
+      };
+      job.updatedAt = new Date().toISOString();
+      job.events.push({
+        stage: "goal_updated",
+        message: "Goal objective and budget updated.",
+        at: job.updatedAt,
+      });
+      await persist();
+      return send(response, 200, { job: taskForResponse(job) }, origin);
+    }
+
+    if (request.method === "DELETE" && goalMatch) {
+      const job = taskJobs.get(goalMatch[1]);
+      if (!job) {
+        return send(response, 404, { error: "Task run not found." }, origin);
+      }
+      if (["queued", "running", "awaiting_approval"].includes(job.status)) {
+        throw new Error("Pause or stop the active goal before clearing it.");
+      }
+      const threadId = job.agentSessions?.codex?.threadId;
+      if (threadId && job.goal?.provider === "codex") {
+        await clearCodexGoal(threadId, {
+          cwd: job.workspace?.path ?? job.repository,
+        });
+      }
+      if (job.goal?.provider === "claude") {
+        delete job.agentSessions?.claude;
+      }
+      job.goal = null;
+      job.updatedAt = new Date().toISOString();
+      job.events.push({
+        stage: "goal_cleared",
+        message: "Durable goal metadata cleared.",
+        at: job.updatedAt,
+      });
+      if (job.status === "paused") {
+        job.status = "failed";
+        job.stage = "failed";
+        job.failedStage = job.pausedStage ?? "execute";
+        job.error = "Goal mode was cleared. Restart the task to continue without it.";
+      }
+      await persist();
+      return send(response, 200, { job: taskForResponse(job) }, origin);
     }
 
     const approvalMatch = url.pathname.match(

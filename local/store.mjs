@@ -66,7 +66,7 @@ function restoredSettings(value) {
 export async function loadCouncilState() {
   const { stateFile } = councilStatePaths();
   const fallback = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     repositories: [],
     settings: DEFAULT_SETTINGS,
     tasks: [],
@@ -75,7 +75,7 @@ export async function loadCouncilState() {
   try {
     const parsed = JSON.parse(await readFile(stateFile, "utf8"));
     return {
-      schemaVersion: 2,
+      schemaVersion: 3,
       repositories: Array.isArray(parsed.repositories)
         ? parsed.repositories
         : [],
@@ -98,7 +98,7 @@ export async function saveCouncilState(state) {
     temporary,
     `${JSON.stringify(
       {
-        schemaVersion: 2,
+        schemaVersion: 3,
         repositories: state.repositories,
         settings: restoredSettings(state.settings),
         tasks: state.tasks,

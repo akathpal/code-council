@@ -31,8 +31,12 @@
     "doctor": "node bin/council.mjs doctor",
     "dev": "node bin/council.mjs --dev",
     "restart": "node bin/council.mjs --restart",
+    "stop": "node bin/council.mjs stop",
     "web:dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev",
     "build": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
+    "ide:build": "tsc -p ide/extension/tsconfig.json",
+    "ide:package": "node ide/scripts/package-extension.mjs",
+    "ide:prepare": "node ide/scripts/prepare-code-oss.mjs",
     "start": "node bin/council.mjs",
     "web:start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
     "openhands": "agent-canvas --backend-only --port 8001",
@@ -43,9 +47,9 @@
   "dependencies": {
     "@openhands/agent-canvas": "1.5.0",
     "drizzle-orm": "0.45.2",
-    "next": "16.2.6",
-    "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "next": "16.2.11",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "1.37.1",
@@ -53,13 +57,15 @@
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
+    "@types/vscode": "1.125.0",
     "@vitejs/plugin-react": "6.0.2",
     "@vitejs/plugin-rsc": "0.5.26",
+    "@vscode/vsce": "3.9.2",
     "drizzle-kit": "0.31.10",
     "eslint": "9.39.4",
-    "eslint-config-next": "16.2.6",
+    "eslint-config-next": "16.2.11",
     "jsdom": "29.1.1",
-    "react-server-dom-webpack": "19.2.6",
+    "react-server-dom-webpack": "19.2.8",
     "tailwindcss": "4.2.1",
     "typescript": "5.9.3",
     "vinext": "0.0.50",
@@ -67,7 +73,7 @@
     "wrangler": "4.92.0"
   },
   "overrides": {
-    "postcss": "8.5.10"
+    "postcss": "8.5.22"
   },
   "type": "module"
 }

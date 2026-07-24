@@ -45,6 +45,9 @@ export async function runCodexAppServer(options) {
   const agentMessages = [];
   let tokenUsage = null;
   let completedTurn = null;
+  let activeThreadId = null;
+  let activeTurnId = null;
+  let goal = null;
   let completeTurn;
   let failTurn;
   const turnCompletion = new Promise((resolve, reject) => {
@@ -57,6 +60,9 @@ export async function runCodexAppServer(options) {
       child.stdin.write(`${JSON.stringify(message)}\n`);
     }
   }
+  child.stdin.on("error", (error) => {
+    if (error.code !== "EPIPE" && !settled) failTurn(error);
+  });
 
   function request(method, params) {
     const id = requestId++;
@@ -146,6 +152,14 @@ export async function runCodexAppServer(options) {
         message.params?.tokenUsage?.last ??
         tokenUsage;
     }
+    if (message.method === "thread/goal/updated") {
+      goal = message.params?.goal ?? goal;
+      options.onGoal?.(goal);
+    }
+    if (message.method === "thread/goal/cleared") {
+      goal = null;
+      options.onGoal?.(null);
+    }
     if (message.method === "turn/completed") {
       completedTurn = message.params?.turn ?? null;
       completeTurn(completedTurn);
@@ -199,17 +213,52 @@ export async function runCodexAppServer(options) {
       capabilities: { experimentalApi: true },
     });
     send({ method: "initialized", params: {} });
-    const thread = await request("thread/start", {
-      model: options.model,
-      cwd: options.cwd,
-      sandbox: options.sandbox ?? "read-only",
-      approvalPolicy: "on-request",
-      approvalsReviewer: "user",
-      ephemeral: true,
+    const thread = options.threadId
+      ? await request("thread/resume", {
+          threadId: options.threadId,
+          model: options.model,
+          cwd: options.cwd,
+          sandbox: options.sandbox ?? "read-only",
+          approvalPolicy: "on-request",
+          approvalsReviewer: "user",
+          excludeTurns: true,
+        })
+      : await request("thread/start", {
+          model: options.model,
+          cwd: options.cwd,
+          sandbox: options.sandbox ?? "read-only",
+          approvalPolicy: "on-request",
+          approvalsReviewer: "user",
+          ephemeral: false,
+        });
+    activeThreadId = thread.thread.id;
+    await options.onThread?.({
+      threadId: activeThreadId,
+      resumed: Boolean(options.threadId),
     });
+    if (options.goal?.objective) {
+      const goalResult = await request("thread/goal/set", {
+        threadId: activeThreadId,
+        objective: options.goal.objective,
+        status: options.goal.status ?? "active",
+        tokenBudget:
+          options.goal.tokenBudget == null
+            ? null
+            : Number(options.goal.tokenBudget),
+      });
+      goal = goalResult.goal ?? null;
+      await options.onGoal?.(goal);
+    }
+    const skillInputs = (options.skills ?? [])
+      .filter((skill) => skill?.name && skill?.path)
+      .map((skill) => ({
+        type: "skill",
+        name: String(skill.name),
+        path: String(skill.path),
+      }));
     const turnParams = {
-      threadId: thread.thread.id,
-      input: [{ type: "text", text: options.prompt }],
+      threadId: activeThreadId,
+      input: [...skillInputs, { type: "text", text: options.prompt }],
       cwd: options.cwd,
       model: options.model,
       effort: options.effort,
@@ -218,7 +267,50 @@ export async function runCodexAppServer(options) {
       sandboxPolicy: sandboxPolicy(options.sandbox, options.cwd),
     };
     if (options.outputSchema) turnParams.outputSchema = options.outputSchema;
-    await request("turn/start", turnParams);
+    const startedTurn = await request("turn/start", turnParams);
+    activeTurnId = startedTurn?.turn?.id ?? startedTurn?.id ?? null;
+    const controller = {
+      threadId: activeThreadId,
+      turnId: activeTurnId,
+      interrupt: () =>
+        request("turn/interrupt", {
+          threadId: activeThreadId,
+          turnId: activeTurnId,
+        }),
+      steer: (text, skills = []) =>
+        request("turn/steer", {
+          threadId: activeThreadId,
+          expectedTurnId: activeTurnId,
+          input: [
+            ...skills
+              .filter((skill) => skill?.name && skill?.path)
+              .map((skill) => ({
+                type: "skill",
+                name: String(skill.name),
+                path: String(skill.path),
+              })),
+            { type: "text", text: String(text) },
+          ],
+        }),
+      setGoal: async (nextGoal) => {
+        const result = await request("thread/goal/set", {
+          threadId: activeThreadId,
+          objective: nextGoal.objective ?? null,
+          status: nextGoal.status ?? null,
+          tokenBudget:
+            nextGoal.tokenBudget == null ? null : Number(nextGoal.tokenBudget),
+        });
+        goal = result.goal ?? null;
+        await options.onGoal?.(goal);
+        return goal;
+      },
+      clearGoal: async () => {
+        await request("thread/goal/clear", { threadId: activeThreadId });
+        goal = null;
+        await options.onGoal?.(null);
+      },
+    };
+    await options.onControl?.(controller);
     const turn = await Promise.race([turnCompletion, closed]);
     if (!turn || turn.status !== "completed") {
       const detail =
@@ -233,12 +325,24 @@ export async function runCodexAppServer(options) {
         .find((item) => item.type === "agentMessage" && item.text)?.text ??
       agentMessages.at(-1) ??
       "";
+    if (options.goal?.objective) {
+      try {
+        goal = (await request("thread/goal/get", {
+          threadId: activeThreadId,
+        }))?.goal ?? goal;
+        await options.onGoal?.(goal);
+      } catch {
+        // The final turn result is still useful if an older CLI cannot read goals.
+      }
+    }
     settled = true;
     child.kill("SIGTERM");
     return {
       text: finalMessage,
       durationMs: Date.now() - startedAt,
+      threadId: activeThreadId,
       turnId: turn.id,
+      goal,
       usage: tokenUsage
         ? {
             inputTokens: Number(tokenUsage.inputTokens ?? 0),
@@ -256,6 +360,7 @@ export async function runCodexAppServer(options) {
     };
   } finally {
     settled = true;
+    await options.onControl?.(null);
     clearTimeout(timer);
     for (const waiting of pending.values()) {
       waiting.reject(new Error("Codex app-server stopped."));
@@ -283,6 +388,12 @@ async function readCodexAppServer(method, params, options = {}) {
       child.stdin.write(`${JSON.stringify(message)}\n`);
     }
   }
+  child.stdin.on("error", (error) => {
+    if (error.code !== "EPIPE" && !stopping) {
+      for (const waiting of pending.values()) waiting.reject(error);
+      pending.clear();
+    }
+  });
 
   function request(method, params) {
     const id = requestId++;
@@ -376,6 +487,48 @@ export function readCodexModels(options = {}) {
       includeHidden: Boolean(options.includeHidden),
       limit: options.limit ?? 100,
     },
+    options,
+  );
+}
+
+export function readCodexSkills(options = {}) {
+  const cwd = options.cwd ?? process.cwd();
+  return readCodexAppServer(
+    "skills/list",
+    {
+      cwds: [cwd],
+      forceReload: Boolean(options.forceReload),
+    },
+    options,
+  );
+}
+
+export function readCodexGoal(threadId, options = {}) {
+  return readCodexAppServer(
+    "thread/goal/get",
+    { threadId },
+    options,
+  );
+}
+
+export function setCodexGoal(threadId, goal, options = {}) {
+  return readCodexAppServer(
+    "thread/goal/set",
+    {
+      threadId,
+      objective: goal.objective ?? null,
+      status: goal.status ?? null,
+      tokenBudget:
+        goal.tokenBudget == null ? null : Number(goal.tokenBudget),
+    },
+    options,
+  );
+}
+
+export function clearCodexGoal(threadId, options = {}) {
+  return readCodexAppServer(
+    "thread/goal/clear",
+    { threadId },
     options,
   );
 }

@@ -790,6 +790,7 @@
 }
 
 .ide-context-popover,
+.ide-github-popover,
 .ide-agent-popover {
   background: #24211f;
   border: 1px solid #48423e;
@@ -797,6 +798,129 @@
   box-shadow: 0 18px 54px rgba(0, 0, 0, 0.38);
   position: absolute;
   z-index: 30;
+}
+
+.ide-github-button {
+  font-size: 10px;
+  padding: 0 8px;
+}
+
+.ide-github-popover {
+  max-height: min(620px, calc(100vh - 90px));
+  overflow: auto;
+  padding: 12px;
+  right: 0;
+  top: 34px;
+  width: min(720px, calc(100vw - 36px));
+}
+
+.ide-github-popover > header {
+  align-items: flex-start;
+  display: flex;
+  justify-content: space-between;
+}
+
+.ide-github-popover > header strong,
+.ide-github-popover > header small {
+  display: block;
+}
+
+.ide-github-popover > header strong {
+  font-size: 12px;
+}
+
+.ide-github-popover > header small {
+  color: var(--ide-quiet);
+  font-size: 8px;
+  margin-top: 3px;
+}
+
+.ide-github-popover > header button,
+.ide-github-columns article button {
+  background: var(--ide-panel-3);
+  border: 1px solid var(--ide-line);
+  border-radius: 6px;
+  color: var(--ide-muted);
+  font-size: 8px;
+  min-height: 26px;
+  padding: 0 7px;
+}
+
+.ide-github-columns {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 11px;
+}
+
+.ide-github-columns > section {
+  background: var(--ide-bg);
+  border: 1px solid var(--ide-line-soft);
+  border-radius: 7px;
+  min-width: 0;
+  padding: 8px;
+}
+
+.ide-github-columns > section > header {
+  align-items: center;
+  display: flex;
+  font-size: 9px;
+  justify-content: space-between;
+  padding: 1px 2px 6px;
+}
+
+.ide-github-columns > section > header span {
+  color: var(--ide-quiet);
+}
+
+.ide-github-columns article {
+  align-items: center;
+  border-top: 1px solid var(--ide-line-soft);
+  display: flex;
+  gap: 7px;
+  justify-content: space-between;
+  padding: 7px 2px;
+}
+
+.ide-github-columns article > div {
+  min-width: 0;
+}
+
+.ide-github-columns article a,
+.ide-github-columns article small {
+  display: block;
+}
+
+.ide-github-columns article a {
+  color: var(--ide-text);
+  font-size: 9px;
+  overflow: hidden;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ide-github-columns article a:hover {
+  color: var(--ide-blue);
+  text-decoration: underline;
+}
+
+.ide-github-columns article small,
+.ide-github-columns section p {
+  color: var(--ide-quiet);
+  font-size: 8px;
+  margin-top: 2px;
+}
+
+.ide-github-error,
+.ide-github-empty {
+  color: var(--ide-muted);
+  font-size: 9px;
+  margin: 12px 0 0;
+}
+
+.ide-github-error {
+  color: var(--ide-red);
 }
 
 .ide-context-popover {
@@ -1810,6 +1934,126 @@ button.ide-environment-card:not(:disabled):hover {
   color: var(--ide-red);
 }
 
+.ide-goal-bar {
+  align-items: center;
+  background: #201f1c;
+  border-top: 1px solid #424038;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  padding: 9px 12px;
+}
+
+.ide-goal-bar.active {
+  border-top-color: rgba(205, 150, 57, 0.5);
+}
+
+.ide-goal-bar.complete {
+  border-top-color: rgba(85, 158, 119, 0.5);
+}
+
+.ide-goal-bar.paused,
+.ide-goal-bar.blocked,
+.ide-goal-bar.budgetLimited,
+.ide-goal-bar.usageLimited {
+  border-top-color: rgba(216, 164, 76, 0.5);
+}
+
+.ide-goal-icon {
+  align-items: center;
+  background: rgba(205, 150, 57, 0.12);
+  border: 1px solid rgba(205, 150, 57, 0.35);
+  border-radius: 7px;
+  color: var(--ide-amber);
+  display: flex;
+  font-size: 16px;
+  height: 30px;
+  justify-content: center;
+  width: 30px;
+}
+
+.ide-goal-copy {
+  min-width: 0;
+}
+
+.ide-goal-copy header {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.ide-goal-copy strong {
+  font-size: 9px;
+  text-transform: capitalize;
+}
+
+.ide-goal-copy header span {
+  color: var(--ide-quiet);
+  font-size: 8px;
+  margin-left: auto;
+}
+
+.ide-goal-copy p {
+  color: var(--ide-muted);
+  font-size: 9px;
+  margin: 3px 0 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ide-goal-progress {
+  background: #34312d;
+  border-radius: 99px;
+  height: 3px;
+  overflow: hidden;
+}
+
+.ide-goal-progress i {
+  background: var(--ide-amber);
+  display: block;
+  height: 100%;
+}
+
+.ide-goal-actions {
+  display: flex;
+  gap: 5px;
+}
+
+.ide-goal-actions button {
+  background: transparent;
+  border: 1px solid var(--ide-line);
+  border-radius: 5px;
+  color: var(--ide-muted);
+  font-size: 8px;
+  min-height: 26px;
+  padding: 0 7px;
+}
+
+.ide-goal-actions button.primary {
+  border-color: rgba(85, 158, 119, 0.5);
+  color: var(--ide-green);
+}
+
+.ide-task-capabilities {
+  align-items: center;
+  background: #1d1b1a;
+  border-top: 1px solid var(--ide-line-soft);
+  color: var(--ide-quiet);
+  display: flex;
+  font-size: 8px;
+  gap: 5px;
+  padding: 6px 12px 0;
+}
+
+.ide-task-capabilities span {
+  background: rgba(93, 147, 198, 0.1);
+  border: 1px solid rgba(93, 147, 198, 0.25);
+  border-radius: 99px;
+  color: var(--ide-blue);
+  padding: 2px 6px;
+}
+
 .ide-composer {
   background: #1d1b1a;
   border-top: 1px solid var(--ide-line);
@@ -1843,12 +2087,180 @@ button.ide-environment-card:not(:disabled):hover {
   border-radius: 0 0 9px 9px;
   border-top: 0;
   display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
   min-height: 39px;
   padding: 4px 6px;
 }
 
 .ide-agent-picker {
   position: relative;
+}
+
+.ide-skill-picker {
+  position: relative;
+}
+
+.ide-skill-popover {
+  background: #24211f;
+  border: 1px solid #4a443f;
+  border-radius: 9px;
+  bottom: 37px;
+  box-shadow: 0 16px 42px rgba(0, 0, 0, 0.35);
+  left: 0;
+  max-height: min(480px, 60vh);
+  overflow: hidden;
+  padding: 9px;
+  position: absolute;
+  width: 390px;
+  z-index: 80;
+}
+
+.ide-skill-popover > header {
+  align-items: flex-start;
+  display: flex;
+  justify-content: space-between;
+  padding: 2px 3px 8px;
+}
+
+.ide-skill-popover > header strong,
+.ide-skill-popover > header small {
+  display: block;
+}
+
+.ide-skill-popover > header strong {
+  font-size: 10px;
+}
+
+.ide-skill-popover > header small,
+.ide-skill-popover button small,
+.ide-skill-list label small {
+  color: var(--ide-quiet);
+  font-size: 8px;
+  line-height: 1.35;
+}
+
+.ide-skill-popover > header button {
+  background: transparent;
+  border: 0;
+  color: var(--ide-muted);
+}
+
+.ide-skill-popover > button {
+  background: #2a2724;
+  border: 1px solid var(--ide-line);
+  border-radius: 6px;
+  color: var(--ide-text);
+  display: block;
+  padding: 7px 8px;
+  text-align: left;
+  width: 100%;
+}
+
+.ide-skill-popover > button.active {
+  border-color: rgba(85, 158, 119, 0.55);
+}
+
+.ide-skill-popover > button span,
+.ide-skill-popover > button small {
+  display: block;
+}
+
+.ide-skill-list {
+  max-height: 330px;
+  overflow: auto;
+  padding-top: 6px;
+}
+
+.ide-skill-list label {
+  align-items: flex-start;
+  border-radius: 5px;
+  cursor: pointer;
+  display: flex;
+  gap: 7px;
+  padding: 7px 5px;
+}
+
+.ide-skill-list label:hover {
+  background: #2d2926;
+}
+
+.ide-skill-list input {
+  margin-top: 2px;
+}
+
+.ide-skill-list label span,
+.ide-skill-list label strong,
+.ide-skill-list label small {
+  display: block;
+  min-width: 0;
+}
+
+.ide-skill-list label strong {
+  align-items: center;
+  display: flex;
+  font-size: 9px;
+  gap: 5px;
+}
+
+.ide-skill-provider {
+  border: 1px solid rgba(84, 148, 216, 0.45);
+  border-radius: 999px;
+  color: #8fc5ff;
+  font-size: 7px;
+  font-style: normal;
+  letter-spacing: 0.02em;
+  padding: 1px 4px;
+}
+
+.ide-skill-provider.claude {
+  border-color: rgba(218, 138, 88, 0.5);
+  color: #e7a77f;
+}
+
+.ide-skill-list label small {
+  margin-top: 2px;
+}
+
+.ide-skill-list > p {
+  color: var(--ide-quiet);
+  font-size: 8px;
+  padding: 10px 5px;
+}
+
+.ide-goal-budget {
+  align-items: center;
+  color: var(--ide-quiet);
+  display: flex;
+  font-size: 8px;
+  gap: 4px;
+}
+
+.ide-goal-budget input {
+  background: transparent;
+  border: 1px solid var(--ide-line);
+  border-radius: 5px;
+  color: var(--ide-muted);
+  font-size: 8px;
+  height: 28px;
+  padding: 0 5px;
+  width: 67px;
+}
+
+.ide-stop-task,
+.ide-resume-task {
+  background: transparent;
+  border: 1px solid #573737;
+  border-radius: 6px;
+  color: var(--ide-red);
+  font-size: 9px;
+  min-height: 28px;
+  padding: 0 8px;
+}
+
+.ide-resume-task {
+  border-color: rgba(85, 158, 119, 0.5);
+  color: var(--ide-green);
 }
 
 .ide-agent-trigger {
@@ -2638,6 +3050,11 @@ button.ide-environment-card:not(:disabled):hover {
 .ide-status.awaiting_input {
   background: color-mix(in srgb, var(--ide-blue) 12%, transparent);
   color: var(--ide-blue);
+}
+
+.ide-status.paused {
+  background: rgba(205, 150, 57, 0.13);
+  color: var(--ide-amber);
 }
 
 .ide-status.accepted,
@@ -4040,6 +4457,11 @@ button.ide-environment-card:not(:disabled):hover {
   background: var(--ide-surface-subtle);
 }
 
+.ide-shell[data-theme="light"] .ide-goal-bar,
+.ide-shell[data-theme="light"] .ide-task-capabilities {
+  background: var(--ide-surface-subtle);
+}
+
 .ide-shell[data-theme="light"] .ide-tabs > button,
 .ide-shell[data-theme="light"] .ide-code-view > header,
 .ide-shell[data-theme="light"] .ide-diff-view > header {
@@ -4050,10 +4472,19 @@ button.ide-environment-card:not(:disabled):hover {
 .ide-shell[data-theme="light"] .ide-composer textarea,
 .ide-shell[data-theme="light"] .ide-composer > footer,
 .ide-shell[data-theme="light"] .ide-context-popover,
+.ide-shell[data-theme="light"] .ide-github-popover,
 .ide-shell[data-theme="light"] .ide-environment-popover,
 .ide-shell[data-theme="light"] .ide-agent-popover,
+.ide-shell[data-theme="light"] .ide-skill-popover,
+.ide-shell[data-theme="light"] .ide-skill-popover > button,
+.ide-shell[data-theme="light"] .ide-goal-budget input,
 .ide-shell[data-theme="light"] .ide-modal {
   background: var(--ide-surface);
+  color: var(--ide-text);
+}
+
+.ide-shell[data-theme="light"] .ide-skill-list label:hover {
+  background: var(--ide-surface-hover);
 }
 
 .ide-shell[data-theme="light"] .ide-modal-tabs {
@@ -5076,6 +5507,20 @@ button.ide-environment-card:not(:disabled):hover {
     display: none;
   }
 
+  .ide-skill-popover {
+    max-width: calc(100vw - 32px);
+    width: 360px;
+  }
+
+  .ide-goal-bar {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .ide-goal-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-end;
+  }
+
   .ide-agent-popover {
     left: -4px;
     max-width: calc(100vw - 32px);
@@ -5099,6 +5544,7 @@ button.ide-environment-card:not(:disabled):hover {
   }
 
   .ide-environment-grid,
+  .ide-github-columns,
   .ide-memory-summary-grid,
   .ide-replay-grid,
   .ide-replay-variants {

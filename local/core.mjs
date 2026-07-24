@@ -5,6 +5,7 @@ import {
   cp,
   lstat,
   mkdir,
+  readdir,
   readFile,
   readlink,
   stat,
@@ -180,15 +181,56 @@ async function runFile(executable, args, options = {}) {
 async function runFileWithInput(executable, args, input, options = {}) {
   const startedAt = Date.now();
   const hasInput = input != null && input.length > 0;
+  const streamingInput = options.streamingInput === true;
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, {
       cwd: options.cwd,
       env: options.env ?? process.env,
-      stdio: [hasInput ? "pipe" : "ignore", "pipe", "pipe"],
+      stdio: [hasInput || streamingInput ? "pipe" : "ignore", "pipe", "pipe"],
     });
     options.onSpawn?.({ child, pid: child.pid, executable, args });
+    let inputClosed = false;
+    const closeInput = () => {
+      if (inputClosed || !child.stdin || child.stdin.destroyed) return;
+      inputClosed = true;
+      child.stdin.end();
+    };
+    const writeInput = (value) =>
+      new Promise((writeResolve, writeReject) => {
+        if (inputClosed || !child.stdin || child.stdin.destroyed) {
+          writeReject(new Error("The agent input stream is no longer active."));
+          return;
+        }
+        child.stdin.write(value, (error) => {
+          if (error) writeReject(error);
+          else writeResolve();
+        });
+      });
+    if (streamingInput) {
+      options.onControl?.({
+        provider: executable,
+        sessionId: options.sessionId ?? null,
+        steer(text) {
+          const message = {
+            type: "user",
+            message: {
+              role: "user",
+              content: [{ type: "text", text: String(text) }],
+            },
+          };
+          return writeInput(`${JSON.stringify(message)}\n`);
+        },
+        async interrupt() {
+          child.kill("SIGINT");
+        },
+      });
+    }
     let stdout = "";
     let stderr = "";
+    let outputLineBuffer = "";
+    let streamedTokens = 0;
+    let budgetInterrupted = false;
+    const usageMessages = new Set();
     let timedOut = false;
     let overflow = false;
     const maxBuffer = options.maxBuffer ?? 20 * 1024 * 1024;
@@ -200,6 +242,47 @@ async function runFileWithInput(executable, args, input, options = {}) {
       const text = chunk.toString();
       stdout += text;
       options.onOutput?.({ stream: "stdout", text });
+      if (streamingInput && !inputClosed) {
+        outputLineBuffer += text;
+        const lines = outputLineBuffer.split(/\r?\n/);
+        outputLineBuffer = lines.pop() ?? "";
+        for (const line of lines) {
+          try {
+            const message = JSON.parse(line);
+            const usage =
+              message?.type === "assistant" ? message.message?.usage : null;
+            if (usage) {
+              const usageId =
+                message.message?.id ??
+                `${usage.input_tokens}:${usage.output_tokens}:${line.length}`;
+              if (!usageMessages.has(usageId)) {
+                usageMessages.add(usageId);
+                streamedTokens +=
+                  Number(usage.input_tokens ?? 0) +
+                  Number(usage.cache_read_input_tokens ?? 0) +
+                  Number(usage.cache_creation_input_tokens ?? 0) +
+                  Number(usage.output_tokens ?? 0);
+                options.onUsage?.({ tokens: streamedTokens });
+                if (
+                  Number(options.tokenBudget ?? Infinity) > 0 &&
+                  streamedTokens >= Number(options.tokenBudget ?? Infinity)
+                ) {
+                  budgetInterrupted = true;
+                  closeInput();
+                  child.kill("SIGINT");
+                  break;
+                }
+              }
+            }
+            if (message?.type === "result") {
+              closeInput();
+              break;
+            }
+          } catch {
+            // Partial and non-JSON output is still retained in the output tail.
+          }
+        }
+      }
       if (stdout.length + stderr.length > maxBuffer) {
         overflow = true;
         child.kill("SIGTERM");
@@ -216,10 +299,12 @@ async function runFileWithInput(executable, args, input, options = {}) {
     });
     child.on("error", (error) => {
       clearTimeout(timer);
+      options.onControl?.(null);
       reject(error);
     });
     child.on("close", (code, signal) => {
       clearTimeout(timer);
+      options.onControl?.(null);
       options.onExit?.({ code, signal });
       if (code === 0) {
         resolve({
@@ -238,6 +323,8 @@ async function runFileWithInput(executable, args, input, options = {}) {
       );
       error.stdout = stdout;
       error.stderr = stderr;
+      error.budgetExceeded = budgetInterrupted;
+      error.tokensUsed = streamedTokens;
       reject(error);
     });
     if (hasInput && child.stdin) {
@@ -247,7 +334,8 @@ async function runFileWithInput(executable, args, input, options = {}) {
         // uncaught EPIPE on Linux/Node 22.
         if (error.code !== "EPIPE") reject(error);
       });
-      child.stdin.end(input);
+      if (streamingInput) child.stdin.write(input);
+      else child.stdin.end(input);
     }
   });
 }
@@ -1260,6 +1348,123 @@ export async function cloneGitHubRepository(repositoryUrl, destinationRoot) {
     repository: { ...repository, name: parts[1] },
     sourceUrl: normalizedUrl,
     cloned: !existing,
+  };
+}
+
+function parseCommandJson(result, label) {
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    throw new Error(`GitHub CLI returned invalid JSON while reading ${label}.`);
+  }
+}
+
+export function summarizeGitHubChecks(checks = []) {
+  const summary = {
+    total: 0,
+    pending: 0,
+    passing: 0,
+    failing: 0,
+    skipped: 0,
+  };
+  for (const check of Array.isArray(checks) ? checks : []) {
+    summary.total += 1;
+    const state = String(
+      check.conclusion ?? check.state ?? check.status ?? "",
+    ).toUpperCase();
+    if (["SUCCESS", "NEUTRAL"].includes(state)) summary.passing += 1;
+    else if (["SKIPPED", "CANCELLED"].includes(state)) summary.skipped += 1;
+    else if (
+      ["FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED", "STALE"].includes(
+        state,
+      )
+    ) {
+      summary.failing += 1;
+    } else {
+      summary.pending += 1;
+    }
+  }
+  return summary;
+}
+
+export async function readGitHubWorkspace(repositoryPath) {
+  const repository = await inspectRepository(repositoryPath);
+  if (!repository.remote || !/github\.com[/:]/i.test(repository.remote)) {
+    throw new Error("This repository does not have a GitHub origin remote.");
+  }
+  const gh = await commandPath("gh");
+  if (!gh) throw new Error("GitHub CLI is not installed.");
+  const [repositoryResult, issuesResult, pullRequestsResult] = await Promise.all([
+    runFile(
+      gh,
+      [
+        "repo",
+        "view",
+        "--json",
+        "nameWithOwner,url,description,defaultBranchRef",
+      ],
+      { cwd: repository.path, timeout: 30_000 },
+    ),
+    runFile(
+      gh,
+      [
+        "issue",
+        "list",
+        "--state",
+        "open",
+        "--limit",
+        "20",
+        "--json",
+        "number,title,body,url,labels,assignees,updatedAt",
+      ],
+      { cwd: repository.path, timeout: 30_000 },
+    ),
+    runFile(
+      gh,
+      [
+        "pr",
+        "list",
+        "--state",
+        "open",
+        "--limit",
+        "20",
+        "--json",
+        "number,title,url,isDraft,headRefName,baseRefName,reviewDecision,statusCheckRollup,updatedAt",
+      ],
+      { cwd: repository.path, timeout: 30_000 },
+    ),
+  ]);
+  const repositoryInfo = parseCommandJson(repositoryResult, "repository");
+  const issues = parseCommandJson(issuesResult, "issues");
+  const pullRequests = parseCommandJson(pullRequestsResult, "pull requests");
+  return {
+    repository: {
+      nameWithOwner: repositoryInfo.nameWithOwner,
+      url: repositoryInfo.url,
+      description: repositoryInfo.description ?? "",
+      defaultBranch: repositoryInfo.defaultBranchRef?.name ?? "main",
+    },
+    issues: issues.map((issue) => ({
+      number: issue.number,
+      title: issue.title,
+      body: String(issue.body ?? "").slice(0, 20_000),
+      url: issue.url,
+      labels: (issue.labels ?? []).map((label) => label.name),
+      assignees: (issue.assignees ?? []).map((assignee) => assignee.login),
+      updatedAt: issue.updatedAt,
+    })),
+    pullRequests: pullRequests.map((pullRequest) => ({
+      number: pullRequest.number,
+      title: pullRequest.title,
+      url: pullRequest.url,
+      isDraft: Boolean(pullRequest.isDraft),
+      headRefName: pullRequest.headRefName,
+      baseRefName: pullRequest.baseRefName,
+      reviewDecision: pullRequest.reviewDecision ?? "",
+      checks: summarizeGitHubChecks(pullRequest.statusCheckRollup),
+      updatedAt: pullRequest.updatedAt,
+    })),
+    fetchedAt: new Date().toISOString(),
   };
 }
 
@@ -2792,11 +2997,247 @@ async function askCodex(
     sandbox,
     model,
     effort,
+    threadId: options.threadId,
+    skills: options.skills,
+    goal: options.goal,
     outputSchema: options.outputSchema,
     timeout: 45 * 60_000,
     maxBuffer: 50 * 1024 * 1024,
     ...options.runtime,
   });
+}
+
+function skillFrontmatter(source) {
+  const text = String(source ?? "");
+  if (!text.startsWith("---")) return {};
+  const end = text.indexOf("\n---", 3);
+  if (end < 0) return {};
+  const values = {};
+  for (const line of text.slice(3, end).split(/\r?\n/)) {
+    const match = line.match(/^([a-zA-Z0-9_-]+):\s*(.*?)\s*$/);
+    if (!match) continue;
+    values[match[1]] = match[2].replace(/^(['"])(.*)\1$/, "$2");
+  }
+  return values;
+}
+
+function skillDescription(source, metadata) {
+  if (metadata.description) return String(metadata.description).slice(0, 1_000);
+  const body = String(source ?? "").replace(/^---[\s\S]*?\n---\s*/, "");
+  const paragraph = body
+    .split(/\n\s*\n/)
+    .map((value) => value.replace(/^#+\s*/gm, "").trim())
+    .find((value) => value && !value.startsWith("<!--"));
+  return String(paragraph ?? "Reusable Claude Code workflow.").slice(0, 1_000);
+}
+
+async function skillFiles(root, options = {}) {
+  const results = [];
+  const pending = [{ directory: root, depth: 0 }];
+  const maxDepth = options.maxDepth ?? 6;
+  const maxFiles = options.maxFiles ?? 300;
+  while (pending.length && results.length < maxFiles) {
+    const current = pending.shift();
+    let entries;
+    try {
+      entries = await readdir(current.directory, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries.sort((left, right) =>
+      left.name.localeCompare(right.name),
+    )) {
+      if (results.length >= maxFiles) break;
+      const entryPath = path.join(current.directory, entry.name);
+      if (entry.isDirectory()) {
+        if (
+          current.depth < maxDepth &&
+          ![".git", "node_modules"].includes(entry.name)
+        ) {
+          pending.push({ directory: entryPath, depth: current.depth + 1 });
+        }
+        continue;
+      }
+      if (
+        entry.isFile() &&
+        (entry.name === "SKILL.md" ||
+          (options.commands === true && entry.name.endsWith(".md")))
+      ) {
+        results.push(entryPath);
+      }
+    }
+  }
+  return results;
+}
+
+function absolutePaths(value, found = new Set()) {
+  if (typeof value === "string") {
+    if (path.isAbsolute(value)) found.add(value);
+    return found;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) absolutePaths(item, found);
+    return found;
+  }
+  if (value && typeof value === "object") {
+    for (const item of Object.values(value)) absolutePaths(item, found);
+  }
+  return found;
+}
+
+async function claudePluginRoots() {
+  try {
+    const result = await runFile("claude", ["plugin", "list", "--json"], {
+      timeout: 10_000,
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    return [...absolutePaths(JSON.parse(result.stdout))];
+  } catch {
+    return [];
+  }
+}
+
+export async function readClaudeSkills(repositoryPath, options = {}) {
+  const repositoryRoot = path.resolve(repositoryPath);
+  const claudeRoot = path.resolve(
+    options.claudeConfigDir ?? path.join(os.homedir(), ".claude"),
+  );
+  const sources = [
+    {
+      root: path.join(repositoryRoot, ".claude", "skills"),
+      scope: "repo",
+      commands: false,
+      precedence: 2,
+    },
+    {
+      root: path.join(repositoryRoot, ".claude", "commands"),
+      scope: "repo",
+      commands: true,
+      precedence: 2,
+    },
+    {
+      root: path.join(claudeRoot, "skills"),
+      scope: "user",
+      commands: false,
+      precedence: 3,
+    },
+    {
+      root: path.join(claudeRoot, "commands"),
+      scope: "user",
+      commands: true,
+      precedence: 3,
+    },
+  ];
+  if (options.includePlugins !== false) {
+    for (const pluginRoot of await claudePluginRoots()) {
+      sources.push({
+        root: path.join(pluginRoot, "skills"),
+        scope: "plugin",
+        commands: false,
+        precedence: 1,
+      });
+    }
+  }
+
+  const discovered = [];
+  const errors = [];
+  for (const source of sources) {
+    for (const skillPath of await skillFiles(source.root, {
+      commands: source.commands,
+    })) {
+      try {
+        const body = await readFile(skillPath, "utf8");
+        const metadata = skillFrontmatter(body);
+        const fallbackName =
+          path.basename(skillPath) === "SKILL.md"
+            ? path.basename(path.dirname(skillPath))
+            : path.basename(skillPath, ".md");
+        const name = String(metadata.name ?? fallbackName).trim();
+        if (!/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,127}$/.test(name)) {
+          errors.push({
+            path: skillPath,
+            message: "Claude skill has an invalid or missing name.",
+          });
+          continue;
+        }
+        const userInvocable = metadata["user-invocable"] !== "false";
+        const modelInvocable =
+          metadata["disable-model-invocation"] !== "true";
+        discovered.push({
+          provider: "claude",
+          name,
+          invocation: name,
+          path: skillPath,
+          scope: source.scope,
+          description: skillDescription(body, metadata),
+          enabled: userInvocable || modelInvocable,
+          userInvocable,
+          modelInvocable,
+          dependencies: null,
+          precedence: source.precedence,
+        });
+      } catch (error) {
+        errors.push({
+          path: skillPath,
+          message: String(error.message ?? error),
+        });
+      }
+    }
+  }
+
+  const selected = new Map();
+  for (const skill of discovered.sort(
+    (left, right) => left.precedence - right.precedence,
+  )) {
+    selected.set(skill.invocation, skill);
+  }
+  return {
+    provider: "claude",
+    cwd: repositoryRoot,
+    skills: [...selected.values()]
+      .map((skill) => {
+        const value = { ...skill };
+        delete value.precedence;
+        return value;
+      })
+      .sort((left, right) => left.name.localeCompare(right.name)),
+    errors,
+  };
+}
+
+function claudeSkillArgs(skills) {
+  const names = [
+    ...new Set(
+      (skills ?? [])
+        .filter((skill) => skill?.provider === "claude")
+        .map((skill) => String(skill.invocation ?? skill.name ?? "").trim())
+        .filter((name) => /^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,127}$/.test(name)),
+    ),
+  ];
+  if (!names.length) return [];
+  return [
+    "--agents",
+    JSON.stringify({
+      "council-skill-runner": {
+        description: "Council task runner with explicitly selected skills.",
+        prompt:
+          "Complete the user's task directly and use the preloaded skills where relevant.",
+        skills: names,
+      },
+    }),
+    "--agent",
+    "council-skill-runner",
+  ];
+}
+
+function claudeInputMessage(prompt) {
+  return `${JSON.stringify({
+    type: "user",
+    message: {
+      role: "user",
+      content: [{ type: "text", text: prompt }],
+    },
+  })}\n`;
 }
 
 async function askClaude(
@@ -2815,9 +3256,22 @@ async function askClaude(
     throw new Error("Invalid Claude model configuration.");
   }
   const canWrite = sandbox === "workspace-write";
+  const sessionArgs = options.sessionId
+    ? options.resumeSession
+      ? ["--resume", options.sessionId]
+      : ["--session-id", options.sessionId]
+    : [];
+  const goal =
+    options.goal?.objective && options.goal.status !== "paused"
+      ? options.goal
+      : null;
+  const agentPrompt = goal
+    ? `/goal ${goal.objective}\n\nTask instructions and repository context:\n${prompt}`
+    : prompt;
+  const skillArgs = claudeSkillArgs(options.skills);
   let result;
   try {
-    result = await runFile(
+    result = await runFileWithInput(
       "claude",
       [
         "-p",
@@ -2833,22 +3287,36 @@ async function askClaude(
           : "Read,Glob,Grep,Bash(git status:*),Bash(git diff:*)",
         "--output-format",
         "stream-json",
+        "--input-format",
+        "stream-json",
+        "--replay-user-messages",
         "--verbose",
         "--include-partial-messages",
-        "--no-session-persistence",
-        prompt,
+        ...skillArgs,
+        ...sessionArgs,
       ],
+      claudeInputMessage(agentPrompt),
       {
         cwd: repositoryPath,
         timeout: 45 * 60_000,
         maxBuffer: 50 * 1024 * 1024,
+        streamingInput: true,
+        sessionId: options.sessionId ?? null,
+        tokenBudget: options.goalRemainingTokens ?? null,
         ...options.runtime,
       },
     );
   } catch (error) {
-    throw new Error(claudeFailure(error));
+    const failure = new Error(claudeFailure(error));
+    failure.budgetExceeded = error.budgetExceeded === true;
+    failure.tokensUsed = Number(error.tokensUsed ?? 0);
+    throw failure;
   }
-  return { ...claudeResult(result.stdout), durationMs: result.durationMs };
+  return {
+    ...claudeResult(result.stdout),
+    durationMs: result.durationMs,
+    sessionId: options.sessionId ?? null,
+  };
 }
 
 function conversationMessage(role, content, details = {}) {
@@ -2859,6 +3327,118 @@ function conversationMessage(role, content, details = {}) {
     at: new Date().toISOString(),
     ...details,
   };
+}
+
+function selectedSkills(value) {
+  const skills = Array.isArray(value?.selected)
+    ? value.selected
+    : Array.isArray(value)
+      ? value
+      : [];
+  const unique = new Map();
+  for (const skill of skills.slice(0, 20)) {
+    const name = String(skill?.name ?? "").trim();
+    const skillPath = String(skill?.path ?? "").trim();
+    if (!name || !skillPath || !path.isAbsolute(skillPath)) continue;
+    unique.set(skillPath, {
+      provider: skill?.provider === "claude" ? "claude" : "codex",
+      name: name.slice(0, 160),
+      invocation:
+        skill?.invocation == null
+          ? name.slice(0, 160)
+          : String(skill.invocation).trim().slice(0, 160),
+      path: skillPath,
+      scope: skill?.scope == null ? null : String(skill.scope),
+      description:
+        skill?.description == null
+          ? null
+          : String(skill.description).trim().slice(0, 1_000),
+    });
+  }
+  return {
+    mode: value?.mode === "explicit" ? "explicit" : "auto",
+    selected: [...unique.values()],
+  };
+}
+
+function selectedGoal(value, objective, strategy = "codex_only") {
+  if (!value || value.enabled !== true) return null;
+  const tokenBudget = Math.max(
+    1_000,
+    Math.min(1_000_000, Math.round(Number(value.tokenBudget) || 50_000)),
+  );
+  return {
+    enabled: true,
+    provider: strategy === "claude_only" ? "claude" : "codex",
+    objective: String(value.objective ?? objective).trim().slice(0, 20_000),
+    status: "active",
+    tokenBudget,
+    tokensUsed: 0,
+    timeUsedSeconds: 0,
+    autoContinue: value.autoContinue !== false,
+    maxContinuations: Math.max(
+      1,
+      Math.min(20, Math.round(Number(value.maxContinuations) || 6)),
+    ),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function newAttempt(number, reason = "initial", startStage = "prepare") {
+  const now = new Date().toISOString();
+  return {
+    id: randomUUID(),
+    number,
+    reason,
+    startStage,
+    status: "queued",
+    stage: "queued",
+    startedAt: now,
+    updatedAt: now,
+    endedAt: null,
+  };
+}
+
+function normalizeAttempts(job) {
+  if (!Array.isArray(job.attempts) || job.attempts.length === 0) {
+    job.attempts = [
+      {
+        ...newAttempt(job.attempt ?? 1, "restored", job.failedStage ?? "prepare"),
+        status: job.status ?? "queued",
+        stage: job.stage ?? "queued",
+        startedAt: job.createdAt ?? new Date().toISOString(),
+        updatedAt: job.updatedAt ?? job.createdAt ?? new Date().toISOString(),
+        endedAt: [
+          "accepted",
+          "rejected",
+          "completed",
+          "failed",
+          "canceled",
+          "conflict",
+        ].includes(job.status)
+          ? job.updatedAt ?? null
+          : null,
+      },
+    ];
+  }
+  return job.attempts;
+}
+
+function currentAttempt(job) {
+  return normalizeAttempts(job).at(-1);
+}
+
+function beginAttempt(job, reason, startStage) {
+  const previous = currentAttempt(job);
+  if (previous && !previous.endedAt) {
+    previous.endedAt = new Date().toISOString();
+    previous.updatedAt = previous.endedAt;
+  }
+  job.attempt = (job.attempt ?? 1) + 1;
+  job.attempts ??= [];
+  job.attempts.push(newAttempt(job.attempt, reason, startStage));
+  job.attempts = job.attempts.slice(-50);
 }
 
 export function normalizeTaskJob(job) {
@@ -2875,6 +3455,27 @@ export function normalizeTaskJob(job) {
   job.baseFingerprint ??= null;
   job.git ??= null;
   job.attempt ??= 1;
+  normalizeAttempts(job);
+  job.skills = selectedSkills(job.skills);
+  job.goal ??= null;
+  if (job.goal) {
+    job.goal = {
+      ...selectedGoal(
+        { ...job.goal, enabled: true },
+        job.prompt,
+        job.decision?.strategy,
+      ),
+      ...job.goal,
+    };
+    job.goal.provider =
+      job.goal.provider === "claude" ||
+      job.decision?.strategy === "claude_only"
+        ? "claude"
+        : "codex";
+  }
+  job.agentSessions ??= {};
+  job.pauseRequested ??= false;
+  job.restartRequested ??= null;
   job.events ??= [];
   job.processes ??= [];
   job.reviewHistory ??= [];
@@ -2968,6 +3569,7 @@ export function createTaskJob(
   decision,
   agentConfig = {},
   contextPolicy = {},
+  executionOptions = {},
 ) {
   const selected = selectedAgentConfig(agentConfig);
   const selectedContext = validateTaskContextPolicy(contextPolicy);
@@ -2982,6 +3584,7 @@ export function createTaskJob(
       }),
     );
   }
+  const attempt = newAttempt(1);
   return {
     id: randomUUID(),
     kind: "code",
@@ -3036,6 +3639,12 @@ export function createTaskJob(
     replay: null,
     failedStage: null,
     attempt: 1,
+    attempts: [attempt],
+    skills: selectedSkills(executionOptions.skills),
+    goal: selectedGoal(executionOptions.goal, prompt, decision.strategy),
+    agentSessions: {},
+    pauseRequested: false,
+    restartRequested: null,
   };
 }
 
@@ -3045,11 +3654,13 @@ export function createChatJob(
   strategy,
   agentConfig = {},
   contextPolicy = {},
+  executionOptions = {},
 ) {
   const selected = selectedAgentConfig(agentConfig);
   const selectedContext = validateTaskContextPolicy(contextPolicy);
   const agent = strategy === "claude_only" ? "claude" : "codex";
   const createdAt = new Date().toISOString();
+  const attempt = newAttempt(1);
   return {
     id: randomUUID(),
     kind: "chat",
@@ -3096,6 +3707,12 @@ export function createChatJob(
     archivedAt: null,
     failedStage: null,
     attempt: 1,
+    attempts: [attempt],
+    skills: selectedSkills(executionOptions.skills),
+    goal: null,
+    agentSessions: {},
+    pauseRequested: false,
+    restartRequested: null,
   };
 }
 
@@ -3144,9 +3761,28 @@ async function updateJob(job, stage, message, options = {}) {
   else if (stage === "awaiting_approval") job.status = "awaiting_approval";
   else if (stage === "conflict") job.status = "conflict";
   else if (stage === "failed") job.status = "failed";
+  else if (stage === "paused") job.status = "paused";
   else job.status = "running";
   job.updatedAt = new Date().toISOString();
   job.events.push({ stage, message, at: job.updatedAt });
+  const attempt = currentAttempt(job);
+  attempt.status = job.status;
+  attempt.stage = stage;
+  attempt.updatedAt = job.updatedAt;
+  if (
+    [
+      "accepted",
+      "rejected",
+      "completed",
+      "failed",
+      "canceled",
+      "conflict",
+    ].includes(job.status)
+  ) {
+    attempt.endedAt = job.updatedAt;
+  } else {
+    attempt.endedAt = null;
+  }
   await options.onUpdate?.(job);
 }
 
@@ -3335,6 +3971,118 @@ function conversationHistory(job) {
     .slice(-30_000);
 }
 
+function syncCodexResult(job, result, stage) {
+  if (result?.threadId) {
+    job.agentSessions ??= {};
+    job.agentSessions.codex = {
+      ...(job.agentSessions.codex ?? {}),
+      threadId: result.threadId,
+      turnId: result.turnId ?? null,
+      stage,
+      status: "idle",
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  if (result?.goal && job.goal) {
+    job.goal = {
+      ...job.goal,
+      ...result.goal,
+      enabled: true,
+      provider: "codex",
+      native: true,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+}
+
+function codexRunOptions(job, options, stage, useGoal = false) {
+  const session = job.agentSessions?.codex;
+  const goal =
+    useGoal &&
+    job.goal?.enabled &&
+    !["complete", "paused"].includes(job.goal.status)
+      ? {
+          objective: job.goal.objective,
+          status: job.goal.status ?? "active",
+          tokenBudget: job.goal.tokenBudget,
+        }
+      : null;
+  return {
+    ...job.agentConfig.codex,
+    threadId: session?.threadId,
+    skills:
+      job.skills?.mode === "explicit"
+        ? (job.skills.selected ?? []).filter(
+            (skill) => skill.provider !== "claude",
+          )
+        : [],
+    goal,
+    runtime: options.agentRuntime?.(job, "codex", stage),
+  };
+}
+
+function claudeRunOptions(job, options, stage) {
+  job.agentSessions ??= {};
+  const existing = job.agentSessions.claude;
+  const sessionId = existing?.sessionId ?? randomUUID();
+  job.agentSessions.claude = {
+    ...(existing ?? {}),
+    sessionId,
+    stage,
+    status: "running",
+    updatedAt: new Date().toISOString(),
+  };
+  const nativeGoalActive =
+    stage === "execute" &&
+    job.goal?.enabled &&
+    job.goal.provider === "claude" &&
+    !["complete", "paused"].includes(job.goal.status);
+  return {
+    ...job.agentConfig.claude,
+    sessionId,
+    resumeSession: Boolean(existing?.sessionId),
+    skills:
+      job.skills?.mode === "explicit"
+        ? (job.skills.selected ?? []).filter(
+            (skill) => skill.provider === "claude",
+          )
+        : [],
+    goal:
+      nativeGoalActive && !existing?.sessionId
+        ? {
+            objective: job.goal.objective,
+            status: job.goal.status,
+            tokenBudget: job.goal.tokenBudget,
+            maxContinuations: job.goal.maxContinuations,
+          }
+        : null,
+    goalRemainingTokens: nativeGoalActive
+      ? Math.max(
+          1,
+          Number(job.goal.tokenBudget ?? 0) -
+            Number(job.goal.tokensUsed ?? 0),
+        )
+      : null,
+    runtime: options.agentRuntime?.(job, "claude", stage),
+  };
+}
+
+function goalNeedsMoreWork(job, result) {
+  return Boolean(
+    job.goal?.enabled &&
+      job.goal.autoContinue !== false &&
+      result?.goal?.status === "active",
+  );
+}
+
+function goalLimitReached(job, continuations) {
+  if (!job.goal) return false;
+  return (
+    Number(job.goal.tokensUsed ?? 0) >= Number(job.goal.tokenBudget ?? Infinity) ||
+    continuations >= Number(job.goal.maxContinuations ?? 6)
+  );
+}
+
 const CLARIFICATION_INSTRUCTION = `If a missing product decision makes it unsafe to proceed, do not edit files. Respond with exactly:
 ${CLARIFICATION_MARKER} <one concise question>
 Only ask when the answer would materially change the implementation.`;
@@ -3480,25 +4228,42 @@ export async function executeChatJob(job, message = null, options = {}) {
     );
     job.contextPack = contextPackRecord(contextPack);
     await options.onUpdate?.(job);
-    const config = job.agentConfig[agent];
+    const continuingAgentSession = Boolean(
+      agent === "codex"
+        ? job.agentSessions?.codex?.threadId
+        : job.agentSessions?.claude?.sessionId,
+    );
     const agentPrompt = withContext(
       contextPack,
-      `You are answering inside a local repository conversation. Be direct and useful. You may inspect source, Git status, and tests, but this is read-only chat: do not edit files. If the user asks you to make a change, explain the intended approach and tell them to use Code mode.
+      continuingAgentSession
+        ? `Follow-up user message:
+
+${prompt}
+
+Answer using the existing conversation context. This remains read-only: do not edit files.`
+        : `You are answering inside a local repository conversation. Be direct and useful. You may inspect source, Git status, and tests, but this is read-only chat: do not edit files. If the user asks you to make a change, explain the intended approach and tell them to use Code mode.
 
 Conversation:
 ${conversationHistory(job)}
 
 Answer the latest user message.`,
     );
+    const runnerOptions =
+      agent === "codex"
+        ? codexRunOptions(job, options, "chat")
+        : claudeRunOptions(job, options, "chat");
+    if (agent === "claude") await options.onUpdate?.(job);
     const result = await rawRunner(
       job.repository,
       agentPrompt,
       "read-only",
-      {
-        ...config,
-        runtime: options.agentRuntime?.(job, agent, "chat"),
-      },
+      runnerOptions,
     );
+    if (agent === "codex") syncCodexResult(job, result, "chat");
+    if (agent === "claude" && job.agentSessions?.claude) {
+      job.agentSessions.claude.status = "idle";
+      job.agentSessions.claude.updatedAt = new Date().toISOString();
+    }
     recordTaskCall(job, agent, "chat", agentPrompt, result);
     job.result = { ...(job.result ?? {}), chat: result.text };
     job.conversation.push(
@@ -3513,7 +4278,29 @@ Answer the latest user message.`,
   } catch (error) {
     job.failedStage = job.stage;
     job.error = String(error.stderr || error.message || error);
-    await updateJob(job, "failed", job.error, options);
+    if (job.restartRequested) {
+      const restart = job.restartRequested;
+      job.restartRequested = null;
+      job.cancelRequested = false;
+      job.error = null;
+      await updateJob(
+        job,
+        "canceled",
+        "The previous reply was stopped so the queued update can run.",
+        options,
+      );
+      job.events.push({
+        stage: "update_restart",
+        message: `Restarting with update: ${restart.message}`,
+        at: new Date().toISOString(),
+      });
+      return retryChatJob(job, options);
+    }
+    if (job.cancelRequested || error.name === "CouncilCanceledError") {
+      await updateJob(job, "canceled", "Reply stopped by the user.", options);
+    } else {
+      await updateJob(job, "failed", job.error, options);
+    }
   }
   return job;
 }
@@ -3523,10 +4310,21 @@ export async function retryChatJob(job, options = {}) {
     throw new Error("Only a failed or canceled chat can be retried.");
   }
   job.error = null;
+  const updatedPrompt = String(options.updatedPrompt ?? "").trim();
+  if (updatedPrompt) {
+    if (updatedPrompt.length > 20_000) {
+      throw new Error("Updated tasks must be 20,000 characters or fewer.");
+    }
+    job.prompt = updatedPrompt;
+    job.conversation ??= [];
+    job.conversation.push(
+      conversationMessage("user", updatedPrompt, { kind: "edit_restart" }),
+    );
+  }
   job.cancelRequested = false;
   job.approval = null;
   job.failedStage = null;
-  job.attempt = (job.attempt ?? 1) + 1;
+  beginAttempt(job, "retry", "chat");
   job.status = "queued";
   job.stage = "queued";
   job.updatedAt = new Date().toISOString();
@@ -3620,7 +4418,7 @@ function recordTaskCall(job, agent, stage, prompt, result) {
     ? job.contextPack?.estimatedTokens ?? 0
     : 0;
   job.usage ??= { calls: [] };
-  job.usage.calls.push({
+  const call = {
     id: randomUUID(),
     agent,
     stage,
@@ -3639,9 +4437,11 @@ function recordTaskCall(job, agent, stage, prompt, result) {
     source: reported ? "reported" : "estimated",
     attempt: job.attempt ?? 1,
     at: new Date().toISOString(),
-  });
+  };
+  job.usage.calls.push(call);
   job.usage.calls = job.usage.calls.slice(-100);
   Object.assign(job.usage, usageTotals(job.usage.calls));
+  return call;
 }
 
 export async function executeTaskJob(job, options = {}) {
@@ -3661,6 +4461,11 @@ export async function executeTaskJob(job, options = {}) {
     !startStage ||
     stageOrder.indexOf(stage) >= Math.max(0, stageOrder.indexOf(startStage));
   const ensureActive = () => {
+    if (job.pauseRequested) {
+      const error = new Error("Goal paused by the user.");
+      error.name = "CouncilPausedError";
+      throw error;
+    }
     if (job.cancelRequested) {
       const error = new Error("Task canceled by the user.");
       error.name = "CouncilCanceledError";
@@ -3670,24 +4475,106 @@ export async function executeTaskJob(job, options = {}) {
   const codexRunner = async (cwd, prompt, sandbox = "read-only") => {
     ensureActive();
     const stage = job.stage;
-    const result = await rawCodexRunner(cwd, prompt, sandbox, {
-      ...job.agentConfig.codex,
-      runtime: options.agentRuntime?.(job, "codex", job.stage),
-    });
+    const useGoal = stage === "execute" && Boolean(job.goal?.enabled);
+    let result = await rawCodexRunner(
+      cwd,
+      prompt,
+      sandbox,
+      codexRunOptions(job, options, stage, useGoal),
+    );
+    syncCodexResult(job, result, stage);
     ensureActive();
     recordTaskCall(job, "codex", stage, prompt, result);
     await options.onUpdate?.(job);
+
+    let continuations = 0;
+    const reports = [result.text].filter(Boolean);
+    while (goalNeedsMoreWork(job, result)) {
+      if (goalLimitReached(job, continuations)) {
+        const exhausted =
+          Number(job.goal?.tokensUsed ?? 0) >=
+          Number(job.goal?.tokenBudget ?? Infinity);
+        job.goal.status = exhausted ? "budgetLimited" : "paused";
+        job.goal.updatedAt = new Date().toISOString();
+        job.events.push({
+          stage: "goal_paused",
+          message: exhausted
+            ? "Goal paused at its token budget."
+            : "Goal paused at its automatic continuation safety limit.",
+          at: job.goal.updatedAt,
+        });
+        await options.onUpdate?.(job);
+        break;
+      }
+      continuations += 1;
+      const continuedAt = new Date().toISOString();
+      job.events.push({
+        stage: "goal_continue",
+        message: `Continuing durable goal (${continuations}/${job.goal.maxContinuations}).`,
+        at: continuedAt,
+      });
+      job.updatedAt = continuedAt;
+      await options.onUpdate?.(job);
+      const continuationPrompt =
+        "Continue working toward the active goal. Inspect the current worktree state, complete the next necessary work, run relevant checks, and mark the goal complete only when the objective and verification are genuinely satisfied.";
+      const continued = await rawCodexRunner(
+        cwd,
+        continuationPrompt,
+        sandbox,
+        codexRunOptions(job, options, stage, true),
+      );
+      syncCodexResult(job, continued, stage);
+      ensureActive();
+      recordTaskCall(job, "codex", stage, continuationPrompt, continued);
+      reports.push(continued.text);
+      result = {
+        ...continued,
+        text: reports.filter(Boolean).join("\n\n"),
+      };
+      await options.onUpdate?.(job);
+    }
     return result;
   };
   const claudeRunner = async (cwd, prompt, sandbox = "read-only") => {
     ensureActive();
     const stage = job.stage;
-    const result = await rawClaudeRunner(cwd, prompt, sandbox, {
-      ...job.agentConfig.claude,
-      runtime: options.agentRuntime?.(job, "claude", job.stage),
-    });
+    const runOptions = claudeRunOptions(job, options, stage);
+    const nativeGoal =
+      stage === "execute" &&
+      job.goal?.enabled &&
+      job.goal.provider === "claude";
+    const goalTokensAtStart = Number(job.goal?.tokensUsed ?? 0);
+    if (nativeGoal) {
+      job.goal.native = true;
+      job.goal.status = "active";
+      job.goal.updatedAt = new Date().toISOString();
+    }
+    await options.onUpdate?.(job);
+    const result = await rawClaudeRunner(
+      cwd,
+      prompt,
+      sandbox,
+      runOptions,
+    );
     ensureActive();
-    recordTaskCall(job, "claude", stage, prompt, result);
+    if (job.agentSessions?.claude) {
+      job.agentSessions.claude.status = "idle";
+      job.agentSessions.claude.updatedAt = new Date().toISOString();
+    }
+    const call = recordTaskCall(job, "claude", stage, prompt, result);
+    if (nativeGoal) {
+      job.goal.tokensUsed = Math.max(
+        Number(job.goal.tokensUsed ?? 0),
+        goalTokensAtStart + Number(call.totalTokens ?? 0),
+      );
+      job.goal.timeUsedSeconds =
+        Number(job.goal.timeUsedSeconds ?? 0) +
+        Math.max(0, Math.round(Number(call.durationMs ?? 0) / 1_000));
+      job.goal.budgetExceeded =
+        job.goal.tokensUsed > Number(job.goal.tokenBudget ?? Infinity);
+      job.goal.status = "complete";
+      job.goal.updatedAt = new Date().toISOString();
+    }
     await options.onUpdate?.(job);
     return result;
   };
@@ -3720,7 +4607,10 @@ export async function executeTaskJob(job, options = {}) {
       if (startStage === "verify" && job.workspace?.path) {
         // Keep the failed review workspace and retry only patch collection.
       } else {
-        const workspace = await prepareWorkspace();
+        const workspace =
+          startStage === "execute" && job.workspace?.path
+            ? job.workspace
+            : await prepareWorkspace();
         await updateJob(
           job,
           "execute",
@@ -3759,7 +4649,10 @@ Do not modify agent_context/. code-council refreshes repository memory only afte
       if (startStage === "verify" && job.workspace?.path) {
         // Keep the failed review workspace and retry only patch collection.
       } else {
-        const workspace = await prepareWorkspace();
+        const workspace =
+          startStage === "execute" && job.workspace?.path
+            ? job.workspace
+            : await prepareWorkspace();
         await updateJob(
           job,
           "execute",
@@ -3906,7 +4799,10 @@ ${CLARIFICATION_INSTRUCTION}`,
       if (startStage === "verify" && job.workspace?.path) {
         // Reuse the implementation worktree and retry only verification.
       } else {
-        const workspace = await prepareWorkspace();
+        const workspace =
+          startStage === "execute" && job.workspace?.path
+            ? job.workspace
+            : await prepareWorkspace();
         await updateJob(
           job,
           "execute",
@@ -3947,6 +4843,27 @@ Do not modify agent_context/. code-council refreshes repository memory only afte
         };
         await options.onUpdate?.(job);
       }
+    }
+
+    if (
+      job.goal?.enabled &&
+      job.goal.native &&
+      job.goal.status !== "complete"
+    ) {
+      job.pausedStage = job.stage;
+      await updateJob(
+        job,
+        "paused",
+        job.goal.status === "budgetLimited"
+          ? "Goal paused at its token budget. Increase the budget or revise the objective to continue."
+          : job.goal.status === "usageLimited"
+            ? "Goal paused because the provider usage limit was reached."
+            : job.goal.status === "blocked"
+              ? "Goal is blocked and needs user input before it can continue."
+              : "Goal paused before completion. Resume when you are ready to continue.",
+        options,
+      );
+      return job;
     }
 
     await updateJob(
@@ -4002,7 +4919,67 @@ Do not modify agent_context/. code-council refreshes repository memory only afte
   } catch (error) {
     job.failedStage = job.stage;
     job.error = String(error.stderr || error.message || error);
-    if (job.cancelRequested || error.name === "CouncilCanceledError") {
+    if (
+      job.goal?.provider === "claude" &&
+      Number(error.tokensUsed ?? 0) > 0
+    ) {
+      job.goal.tokensUsed = Math.max(
+        Number(job.goal.tokensUsed ?? 0),
+        Number(error.tokensUsed),
+      );
+      job.goal.updatedAt = new Date().toISOString();
+    }
+    if (job.pauseRequested) {
+      job.pausedStage = job.failedStage;
+      job.pauseRequested = false;
+      job.cancelRequested = false;
+      job.error = null;
+      await updateJob(
+        job,
+        "paused",
+        "Goal paused. The isolated worktree and agent thread are preserved.",
+        options,
+      );
+    } else if (
+      job.goal?.provider === "claude" &&
+      job.goal.native &&
+      (error.budgetExceeded === true ||
+        /(max(?:imum)?\s+turn|turn\s+limit|budget)/i.test(job.error))
+    ) {
+      job.pausedStage = job.failedStage;
+      job.goal.status =
+        error.budgetExceeded === true || /budget/i.test(job.error)
+          ? "budgetLimited"
+          : "paused";
+      job.goal.updatedAt = new Date().toISOString();
+      job.error = null;
+      await updateJob(
+        job,
+        "paused",
+        job.goal.status === "budgetLimited"
+          ? "Claude Goal paused at the provider budget limit."
+          : "Claude Goal paused at the automatic turn safety limit.",
+        options,
+      );
+    } else if (job.restartRequested) {
+      const restart = job.restartRequested;
+      job.restartRequested = null;
+      job.cancelRequested = false;
+      await cleanupTaskWorktree(job);
+      await updateJob(
+        job,
+        "canceled",
+        "The active attempt stopped so the updated task can restart.",
+        options,
+      );
+      job.events.push({
+        stage: "update_restart",
+        message: `Restarting with update: ${restart.message}`,
+        at: new Date().toISOString(),
+      });
+      job.error = null;
+      return retryTaskJob(job, "prepare", options);
+    } else if (job.cancelRequested || error.name === "CouncilCanceledError") {
       await cleanupTaskWorktree(job);
       await updateJob(job, "canceled", "Task canceled by the user.", options);
     } else {
@@ -4019,6 +4996,22 @@ export async function retryTaskJob(
 ) {
   if (!["failed", "canceled", "conflict"].includes(job.status)) {
     throw new Error("Only a failed, canceled, or conflicted task can be retried.");
+  }
+  const updatedPrompt = String(options.updatedPrompt ?? "").trim();
+  if (updatedPrompt) {
+    if (updatedPrompt.length > 20_000) {
+      throw new Error("Updated tasks must be 20,000 characters or fewer.");
+    }
+    job.prompt = updatedPrompt;
+    job.conversation ??= [];
+    job.conversation.push(
+      conversationMessage("user", updatedPrompt, { kind: "edit_restart" }),
+    );
+    if (job.goal) {
+      job.goal.objective = updatedPrompt;
+      job.goal.status = "active";
+      job.goal.updatedAt = new Date().toISOString();
+    }
   }
   const retryableStages = new Set([
     "prepare",
@@ -4066,7 +5059,17 @@ export async function retryTaskJob(
   job.cancelRequested = false;
   job.approval = null;
   job.failedStage = null;
-  job.attempt = (job.attempt ?? 1) + 1;
+  beginAttempt(job, stage === "prepare" ? "restart" : "retry", stage);
+  if (stage === "prepare") {
+    job.agentSessions = {};
+    if (job.goal) {
+      job.goal.status = "active";
+      job.goal.tokensUsed = 0;
+      job.goal.timeUsedSeconds = 0;
+      job.goal.native = false;
+      job.goal.updatedAt = new Date().toISOString();
+    }
+  }
   job.status = "queued";
   job.stage = "queued";
   job.updatedAt = new Date().toISOString();
@@ -4114,6 +5117,11 @@ export async function reviseTaskJob(job, feedback, options = {}) {
   job.error = null;
 
   const ensureActive = () => {
+    if (job.pauseRequested) {
+      const error = new Error("Goal paused by the user.");
+      error.name = "CouncilPausedError";
+      throw error;
+    }
     if (job.cancelRequested) {
       const error = new Error("Task canceled by the user.");
       error.name = "CouncilCanceledError";
@@ -4143,8 +5151,12 @@ export async function reviseTaskJob(job, feedback, options = {}) {
     await options.onUpdate?.(job);
 
     ensureActive();
-    const agentConfig = selectedAgentConfig(job.agentConfig);
     const currentDiff = String(previousReview?.diff ?? "").slice(0, 120_000);
+    const revisionOptions =
+      revisionAgent === "codex"
+        ? codexRunOptions(job, options, job.stage, false)
+        : claudeRunOptions(job, options, job.stage);
+    if (revisionAgent === "claude") await options.onUpdate?.(job);
     const revision = await rawRevisionRunner(
       job.workspace.path,
       withContext(
@@ -4165,11 +5177,14 @@ ${CLARIFICATION_INSTRUCTION}
 Do not modify agent_context/. code-council refreshes repository memory only after the user accepts the final patch.`,
       ),
       "workspace-write",
-      {
-        ...agentConfig[revisionAgent],
-        runtime: options.agentRuntime?.(job, revisionAgent, job.stage),
-      },
+      revisionOptions,
     );
+    if (revisionAgent === "codex") {
+      syncCodexResult(job, revision, "revision_requested");
+    } else if (job.agentSessions?.claude) {
+      job.agentSessions.claude.status = "idle";
+      job.agentSessions.claude.updatedAt = new Date().toISOString();
+    }
     ensureActive();
     if (
       await pauseForClarification(
@@ -4213,7 +5228,36 @@ Do not modify agent_context/. code-council refreshes repository memory only afte
     );
   } catch (error) {
     job.error = String(error.stderr || error.message || error);
-    if (job.cancelRequested || error.name === "CouncilCanceledError") {
+    if (job.pauseRequested) {
+      job.pausedStage = "revision_requested";
+      job.pauseRequested = false;
+      job.cancelRequested = false;
+      job.error = null;
+      await updateJob(
+        job,
+        "paused",
+        "Goal paused. The isolated worktree and agent thread are preserved.",
+        options,
+      );
+    } else if (job.restartRequested) {
+      const restart = job.restartRequested;
+      job.restartRequested = null;
+      job.cancelRequested = false;
+      await cleanupTaskWorktree(job);
+      await updateJob(
+        job,
+        "canceled",
+        "The active revision stopped so the updated task can restart.",
+        options,
+      );
+      job.events.push({
+        stage: "update_restart",
+        message: `Restarting with update: ${restart.message}`,
+        at: new Date().toISOString(),
+      });
+      job.error = null;
+      return retryTaskJob(job, "prepare", options);
+    } else if (job.cancelRequested || error.name === "CouncilCanceledError") {
       await cleanupTaskWorktree(job);
       await updateJob(job, "canceled", "Task canceled by the user.", options);
     } else {
@@ -4239,6 +5283,106 @@ export async function cancelTaskJob(job, options = {}) {
   });
   await options.onUpdate?.(job);
   return job;
+}
+
+export async function updateActiveTaskJob(
+  job,
+  message,
+  options = {},
+) {
+  if (!["queued", "running", "awaiting_approval"].includes(job.status)) {
+    throw new Error("Only an active task can be updated.");
+  }
+  const instruction = String(message ?? "").trim();
+  if (!instruction) throw new Error("Enter an update.");
+  if (instruction.length > 20_000) {
+    throw new Error("Task updates must be 20,000 characters or fewer.");
+  }
+  job.conversation ??= [];
+  job.conversation.push(
+    conversationMessage("user", instruction, {
+      kind: options.restart ? "update_restart" : "steering",
+    }),
+  );
+  const now = new Date().toISOString();
+  if (options.restart) {
+    job.prompt = `${job.prompt}\n\nUser update:\n${instruction}`;
+    job.restartRequested = { message: instruction, requestedAt: now };
+    job.cancelRequested = true;
+    job.events.push({
+      stage: "update_requested",
+      message: "Stopping this attempt and restarting with the new instruction.",
+      at: now,
+    });
+  } else {
+    job.events.push({
+      stage: "steered",
+      message: "The update was delivered to the active agent turn.",
+      at: now,
+    });
+  }
+  job.updatedAt = now;
+  await options.onUpdate?.(job);
+  return job;
+}
+
+export async function pauseTaskJob(job, options = {}) {
+  if (!job.goal?.enabled) {
+    throw new Error("Only a goal-mode task can be paused.");
+  }
+  if (!["queued", "running", "awaiting_approval"].includes(job.status)) {
+    throw new Error("Only an active goal can be paused.");
+  }
+  job.pausedStage = job.stage;
+  job.pauseRequested = true;
+  job.goal.status = "paused";
+  job.goal.updatedAt = new Date().toISOString();
+  job.events.push({
+    stage: "pause_requested",
+    message: "Pausing the durable goal after interrupting the active turn.",
+    at: job.goal.updatedAt,
+  });
+  job.updatedAt = job.goal.updatedAt;
+  await options.onUpdate?.(job);
+  return job;
+}
+
+export async function resumeTaskJob(job, options = {}) {
+  if (!job.goal?.enabled || job.status !== "paused") {
+    throw new Error("Only a paused goal can be resumed.");
+  }
+  if (
+    job.goal.status === "budgetLimited" &&
+    Number(job.goal.tokensUsed ?? 0) >= Number(job.goal.tokenBudget ?? 0)
+  ) {
+    throw new Error("Increase the goal token budget before resuming.");
+  }
+  job.pauseRequested = false;
+  job.cancelRequested = false;
+  job.error = null;
+  job.goal.status = "active";
+  job.goal.updatedAt = new Date().toISOString();
+  job.status = "queued";
+  job.stage = "queued";
+  job.updatedAt = job.goal.updatedAt;
+  job.events.push({
+    stage: "goal_resumed",
+    message: "Resuming the durable goal with its preserved agent thread and worktree.",
+    at: job.updatedAt,
+  });
+  const attempt = currentAttempt(job);
+  attempt.status = "queued";
+  attempt.stage = "queued";
+  attempt.endedAt = null;
+  attempt.updatedAt = job.updatedAt;
+  await options.onUpdate?.(job);
+  return executeTaskJob(job, {
+    ...options,
+    startStage:
+      job.pausedStage === "execute" && job.workspace?.path
+        ? "execute"
+        : "prepare",
+  });
 }
 
 export async function acceptTaskJob(job, options = {}) {
